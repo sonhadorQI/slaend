@@ -4,7 +4,7 @@ const dotenv = require("dotenv");
 dotenv.config();
 
 function generateAuthPayload() {
-  const salt = process.env.Salt;
+  const salt = process.env.LeagueSalt;
   if (!salt) {
     throw new Error("LeagueSalt não definida no .env");
   }

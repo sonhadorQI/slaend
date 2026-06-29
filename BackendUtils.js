@@ -6,82 +6,161 @@ const Console = require("./ConsoleUtils");
 const dotenv = require('dotenv');
 dotenv.config();
 const CryptoUtils = require("./CryptoUtils");
-const axios = require('axios');
-const zlib = require('zlib');
-const fs = require('fs');
-const path = require('path');
-
-function getSharedData() {
-  try {
-    return JSON.parse(fs.readFileSync(path.join(__dirname, 'shared.json'), 'utf8'));
-  } catch (e) {
-    try {
-      return require("./shared.json");
-    } catch {
-      return {};
-    }
-  }
-}
 
 const SharedUtils = require("./SharedUtils.js");
 const SharedData = require("./shared.json");
 
+const BackendUtils = {
+  generateId: () => crypto.randomBytes(16).toString('hex'),
+  createHash: (...args) => crypto.createHash('sha256').update(args.join('')).digest('hex'),
+  getTimestamp: () => Math.floor(Date.now() / 1000),
+  validateAuthHeader: (authHeader) => {
+    if (!authHeader || typeof authHeader !== 'string') return null;
+    try {
+      const parsed = JSON.parse(authHeader);
+      if (!parsed.DeviceId) return null;
+      return { DeviceId: parsed.DeviceId, StumbleId: parsed.StumbleId };
+    } catch {
+      return null;
+    }
+  },
+  createLoginHash: (deviceId, version, timestamp, stumbleId, steamTicket, scopelyId) => {
+    const hashInput = `${deviceId}${version}${timestamp}${stumbleId || ''}${steamTicket || ''}${scopelyId || ''}${process.env.LeagueSalt}`;
+    return crypto.createHash('md5').update(hashInput).digest('hex');
+  },
+  createRegularHash: (deviceId, googleId, token, timestamp, stumbleId, url, body) => {
+    const hashInput = `${deviceId}${googleId}${token}${timestamp}${stumbleId}${url}${body || ''}${process.env.LeagueSalt}`;
+    return crypto.createHash('md5').update(hashInput).digest('hex');
+  },
+  createGameId: (type = 'regular') => {
+    const prefix = type === 'event' ? 'EV' : 'RG';
+    return `${prefix}-${crypto.randomBytes(8).toString('hex').toUpperCase()}`;
+  },
+  formatNumber: (num) => {
+    return new Intl.NumberFormat('en-US').format(num);
+  },
+  GenAndroidId: () => {
+    return `android-${crypto.randomBytes(8).toString('hex')}`;
+  },
+  GenCaracters: (length) => {
+    return crypto.randomBytes(Math.ceil(length / 2)).toString('hex').slice(0, length);
+  },
+  LeagueEncrypt: (text) => {
+    const cipher = crypto.createCipheriv('aes-256-cbc', process.env.LeagueSalt, crypto.randomBytes(16));
+    let encrypted = cipher.update(text, 'utf8', 'hex');
+    encrypted += cipher.final('hex');
+    return encrypted;
+  },
+  Hash: (algorithm, data) => {
+    return crypto.createHash(algorithm).update(data).digest('hex');
+  }
+};
+
 class Database {
   constructor() {
     this.mongoUri = process.env.mongoUri;
-    this.dbName = "StumbleRush";
+    this.dbName = 'StumbleHot';
     this.client = null;
     this.db = null;
     this.collections = {
-      Users: null,
-      Analytics: null,
-      News: null,
-      Events: null,
-      BattlePasses: null,
-      Skins: null,
-      Missions: null,
-      PurchasableItems: null,
-      Animations: null,
-      Emotes: null,
-      Footsteps: null,
-      TournamentsX: null,
-      Anticheat: null,
-      Parties: null,
-      CreatorCodes: null
-    };
+  Users: null,
+  Analytics: null,
+  News: null,
+  Events: null,
+  BattlePasses: null,
+  Skins: null,
+  Missions: null,
+  PurchasableItems: null,
+  Animations: null,
+  Emotes: null,
+  Footsteps: null
+};
+  }
+
+  async connectWithRetry(maxRetries = 5, retryDelay = 5000) {
+    let lastError;
+    
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        Console.log("Database", `Tentando conectar (tentativa ${attempt}/${maxRetries})...`);
+        
+        this.client = new MongoClient(this.mongoUri, {
+          serverSelectionTimeoutMS: 30000,
+          connectTimeoutMS: 30000,
+          socketTimeoutMS: 45000,
+        });
+        
+        await this.client.connect();
+        this.db = this.client.db(this.dbName);
+        this.collections.Users = this.db.collection("Users");
+        this.collections.Analytics = this.db.collection("Analytics");
+        this.collections.News = this.db.collection("News");
+        this.collections.Events = this.db.collection("Events");
+        this.collections.BattlePasses = this.db.collection("BattlePasses");
+        this.collections.Skins = this.db.collection("Skins");
+        this.collections.Missions = this.db.collection("Missions");
+        this.collections.PurchasableItems = this.db.collection("PurchasableItems");
+        this.collections.Animations = this.db.collection("Animations");
+        this.collections.Emotes = this.db.collection("Emotes");
+        this.collections.Footsteps = this.db.collection("Footsteps");
+
+        await this.createIndexes();
+        await this.autoPopulateSharedData();
+        Console.log("Database", "Conectado ao banco de dados com sucesso!");
+        return true;
+        
+      } catch (error) {
+        lastError = error;
+        Console.error("Database", `Erro na tentativa ${attempt}:`, error.message);
+        
+        if (attempt < maxRetries) {
+          Console.log("Database", `Aguardando ${retryDelay/1000} segundos para tentar novamente...`);
+          await new Promise(resolve => setTimeout(resolve, retryDelay));
+        }
+      }
+    }
+    
+    throw lastError;
   }
 
   async connect() {
-    this.client = new MongoClient(this.mongoUri);
-    await this.client.connect();
-    this.db = this.client.db(this.dbName);
-
-    this.collections.Users = this.db.collection("Users");
-    this.collections.Analytics = this.db.collection("Analytics");
-    this.collections.News = this.db.collection("News");
-    this.collections.Events = this.db.collection("Events");
-    this.collections.BattlePasses = this.db.collection("BattlePasses");
-    this.collections.Skins = this.db.collection("Skins");
-    this.collections.Missions = this.db.collection("Missions");
-    this.collections.PurchasableItems = this.db.collection("PurchasableItems");
-    this.collections.Animations = this.db.collection("Animations");
-    this.collections.Emotes = this.db.collection("Emotes");
-    this.collections.Footsteps = this.db.collection("Footsteps");
-    this.collections.TournamentsX = this.db.collection("TournamentsX");
-    this.collections.Anticheat = this.db.collection("Anticheat");
-    this.collections.Parties = this.db.collection("Parties");
-    this.collections.CreatorCodes = this.db.collection("CreatorCodes");
-    
-    await this.checkOnlineUsers()
-    await this.createIndexes();
-    await this.autoPopulateSharedData();
-
-
-    
-
-    Console.log("Database", "Connected to database");
+    return this.connectWithRetry(5, 5000);
   }
 
+async autoPopulateSharedData() {
+    try {
+        if (SharedData.Skins_v4?.length > 0) {
+            await this.collections.Skins.deleteMany({});
+            for (const skin of SharedData.Skins_v4) {
+                await this.collections.Skins.insertOne({ ...skin });
+            }
+        }
+
+        if (SharedData.Animations_v2?.length > 0) {
+            await this.collections.Animations.deleteMany({});
+            for (const anim of SharedData.Animations_v2) {
+                await this.collections.Animations.insertOne({ ...anim });
+            }
+        }
+
+        if (SharedData.Emotes_v2?.length > 0) {
+            await this.collections.Emotes.deleteMany({});
+            for (const emote of SharedData.Emotes_v2) {
+                await this.collections.Emotes.insertOne({ ...emote });
+            }
+        }
+
+        if (SharedData.Footsteps?.length > 0) {
+            await this.collections.Footsteps.deleteMany({});
+            for (const footstep of SharedData.Footsteps_v2) {
+                await this.collections.Footsteps.insertOne({ ...footstep });
+            }
+        }
+
+    } catch (error) {
+        Console.error('Populate', 'Erro ao popular coleções:', error);
+    }
+  }
   async createIndexes() {
     await this.collections.Users.createIndexes([
       { key: { deviceId: 1 }, unique: true, sparse: true },
@@ -90,7 +169,7 @@ class Database {
       { key: { friends: 1 } },
       { key: { sentFriendRequests: 1 } },
       { key: { receivedFriendRequests: 1 } },
-      { key: { "balances.name": 1 } }
+      { key: { 'balances.name': 1 } }
     ]);
 
     await this.collections.Events.createIndex({ StartDateTime: 1, EndDateTime: 1 });
@@ -98,144 +177,9 @@ class Database {
     await this.collections.Skins.createIndex({ SkinID: 1 });
   }
 
-  async autoPopulateSharedData() {
-    try {
-      if (SharedData.Skins_v4?.length > 0) {
-        await this.collections.Skins.deleteMany({});
-        for (const skin of SharedData.Skins_v4) {
-          await this.collections.Skins.insertOne({ ...skin });
-        }
-      }
-
-      if (SharedData.Animations_v2?.length > 0) {
-        await this.collections.Animations.deleteMany({});
-        for (const anim of SharedData.Animations_v2) {
-          await this.collections.Animations.insertOne({ ...anim });
-        }
-      }
-
-      if (SharedData.Emotes_v2?.length > 0) {
-        await this.collections.Emotes.deleteMany({});
-        for (const emote of SharedData.Emotes_v2) {
-          await this.collections.Emotes.insertOne({ ...emote });
-        }
-      }
-
-      if (SharedData.Footsteps?.length > 0) {
-        await this.collections.Footsteps.deleteMany({});
-        for (const footstep of SharedData.Footsteps) {
-          await this.collections.Footsteps.insertOne({ ...footstep });
-        }
-      }
-    } catch (error) {
-      Console.error("Populate", "Erro ao popular coleções:", error);
-    }
-  }
-
-  async autoPopulateTournaments() {
-    try {
-      const exists = await this.collections.TournamentsX.findOne({ id: 400 });
-      if (!exists) {
-        await this.collections.TournamentsX.insertOne({
-          id: 1,
-          type: 1,
-          isEnabled: true,
-          minVersion: "0.50",
-          startTime: new Date("2025-07-24T10:00:00Z"),
-          endTime: new Date("2025-08-07T10:00:00Z"),
-          nameKey: "Ranked 1x1",
-          descriptionKey: "RANKED_TOURNAMENT_DESC",
-          listItemBackgroundImage: "Ranked_Background_Image_Tournaments_Card",
-          detailsPanelBackgroundImage: "Ranked_Background_Image_Tournaments",
-          prizeBannerColour: "#00FFCC",
-          headerColour: "#00FFCC",
-          mapListGradientColourTop: "#00FFCC",
-          mapListGradientColourBottom: "#006666",
-          listPriority: 0,
-          minPlayers: 2,
-          maxPlayers: 2,
-          maxRounds: 1,
-          minMatchmakingSeconds: 0,
-          entryCurrencyType: "gems",
-          entryCurrencyCost: 30,
-          entryCurrencyType2: "tournament_ticket_rare",
-          entryCurrencyCost2: 0,
-          areEmotesRestricted: false,
-          prohibitedEmotes: [],
-          detailsPanelBorderColourTop: "#00FFCC",
-          detailsPanelBorderColourBottom: "#006666",
-          colourData: {
-            detailsPanelMainColour: "#00CC99",
-            detailsPanelBorderColour: "#00FFCC",
-            headerGradientRight: "#00CC99",
-            headerGradientLeft: "#00FFCC",
-            infoWidgetsGradientRight: "#00CC99",
-            infoWidgetsGradientLeft: "#009977",
-            infoWidgetsBorderColour: "#00FFCC"
-          },
-          rounds: [
-            {
-              roundOrder: 1,
-              maxPlayersToProgress: 1,
-              minPlayersPerMatch: 2,
-              maxPlayersPerMatch: 2,
-              areLevelsRestricted: true,
-              permittedLevels: ["level19_block"]
-            }
-          ],
-          awards: [
-            { placementRangeLowest: 1, placementRangeHighest: 1, awardId: 1, type: "XP", amount: 200 },
-            { placementRangeLowest: 1, placementRangeHighest: 1, awardId: 2, type: "TROPHIES", amount: 15 },
-            { placementRangeLowest: 1, placementRangeHighest: 1, awardId: 3, type: "TOURNAMENTXP", amount: 50 },
-            { placementRangeLowest: 1, placementRangeHighest: 1, awardId: 4, type: "CROWNS", amount: 1 }
-          ],
-          players: []
-        });
-      }
-    } catch (err) {
-      Console.error("TournamentX", "Erro ao criar torneio padrão:", err);
-    }
-  }
-
-  async checkOnlineUsers() {
-  const minuto = 15 * 60 * 1000
-  const now = new Date()
-
-  try {
-    const onlineUsers = await this.collections.Users.find({
-      lastLogin: { $gte: new Date(now - minuto) }
-    }).toArray()
-
-    if (!onlineUsers.length) return
-
-    const userCount = onlineUsers.length
-
-    const webhookUrl = process.env.WebhookUrl
-    if (!webhookUrl) return
-
-    const embed = {
-      title: "🟢 Usuários Online",
-      description: `Há **${userCount}** usuarios online nos últimos 15 minutos.`,
-      color: 0x00ff00,
-      footer: { text: "League - Status Online" },
-      timestamp: new Date().toISOString()
-    }
-
-    await axios.post(webhookUrl, {
-      embeds: [embed]
-    })
-
-  } catch (err) {
-    console.error("Erro ao enviar webhook de usuários online:", err)
-  }
-}
-
-
   async getUserByQuery(query) {
     return await this.collections.Users.findOne(query);
   }
-
-  
 
   async updateUser(query, updates) {
     await this.collections.Users.updateOne(query, { $set: updates });
@@ -247,34 +191,19 @@ class Database {
   }
 
   async incrementUserBalance(query, currency, amount) {
-    const user = await this.getUserByQuery(query);
-    if (!user) {
-        throw new Error("User not found");
+    const result = await this.collections.Users.updateOne(
+      { ...query, 'balances.name': currency },
+      { $inc: { 'balances.$.amount': amount } }
+    );
+
+    if (result.matchedCount === 0 && amount > 0) {
+      await this.collections.Users.updateOne(
+        query,
+        { $push: { balances: { name: currency, amount } } }
+      );
     }
-
-    const currentBalance = user.balances.find(b => b.name === currency);
-    const currentAmount = currentBalance ? currentBalance.amount : 0;
-    
-    const newAmount = currentAmount + amount;
-    const finalAmount = Math.max(0, newAmount);
-
-    if (currentBalance) {
-        const result = await this.collections.Users.updateOne(
-            { ...query, "balances.name": currency },
-            { $set: { "balances.$.amount": finalAmount } }
-        );
-
-        return result;
-    } else if (amount > 0) {
-        await this.collections.Users.updateOne(query, {
-            $push: { balances: { name: currency, amount: finalAmount } }
-        });
-        
-        return { matchedCount: 1, modifiedCount: 1 };
-    } else {
-        return { matchedCount: 0, modifiedCount: 0 };
-    }
-}
+    return result;
+  }
 
   async createUser(userData) {
     const result = await this.collections.Users.insertOne(userData);
@@ -306,193 +235,241 @@ class Database {
   }
 }
 
-
 const database = new Database();
-database.connect().catch(err => {
-  console.error('Database connection error:', err);
+database.connectWithRetry(5, 5000).catch(err => {
+  console.error('Database connection error after all retries:', err);
+  Console.error("Database", "Verifique se o cluster MongoDB Atlas está online e o IP está liberado.");
+  Console.error("Database", "Acesse: https://cloud.mongodb.com -> Network Access -> Add IP Address -> 0.0.0.0/0");
   process.exit(1);
 });
 
 class UserModel {
-  static async create(ip, deviceId, platformData = {}) {
-  const now = new Date();
-  const userId = Math.floor(Math.random() * 9999);
-  const username = 'StumbleLeague ' + CryptoUtils.GenCaracters(10).toUpperCase();
-  
-  let ipCountry = 'US';
-  let ipRegion = 'NA';
-  
-  try {
-    const response = await axios.get(`https://ipapi.co/${ip}/json/`);
-    if (response.data && response.data.country_code) {
-      ipCountry = response.data.country_code;
-      ipRegion = response.data.continent_code || 'NA';
-    }
-  } catch (error) {
-    console.error('Erro ao detectar localização do IP:', error);
-    ipCountry = 'US';
-    ipRegion = 'NA';
-  }
 
-  const user = {
-    id: userId,
-    deviceId,
-    stumbleId: CryptoUtils.GenerateId().toUpperCase(),
-    username,
-    country: ipCountry,
-    region: ipRegion,
-    token: CryptoUtils.SessionToken(),
-    version: platformData.Version || "0.1",
-    ip,
-    creationDate: now,
-    last: now,
-    newsVersion: 0,
-    skillRating: 0,
-    experience: 0,
-    crowns: 0,
-    hiddenRating: 0,
-    isBanned: false,
-    inventory: [{
-      userId,
-      itemId: 803,
-      itemType: "DUPLICATE_BANK",
-      item: "CONFIG_VERSION",
-      amount: 3
-    }],
-    skins: ["SKIN1", "SKIN2"],
-    emotes: ["emote_cry", "emote_hi", "emote_gg", "emote_haha", "emote_happy"],
-    animations: ["animation1"],
-    footsteps: ["footsteps_smoke"],
-    friends: [],
-    sentFriendRequests: [],
-    receivedFriendRequests: [],
-    hasBattlePass: false,
-    passTokens: 0,
-    freePassRewards: [],
-    premiumPassRewards: [],
-    balances: [
-      { name: "coins", amount: 101, secondsSince: 0, secondsPerUnit: 0, maxAmount: 0, lastGiven: now },
-      { name: "remove_ads", amount: 0, secondsSince: 0, secondsPerUnit: 0, maxAmount: 2, lastGiven: now },
-      { name: "video", amount: 50, secondsSince: 0, secondsPerUnit: 0, maxAmount: 5000, lastGiven: now },
-      { name: "gems", amount: 20000, secondsSince: 0, secondsPerUnit: 0, maxAmount: 0, lastGiven: now },
-      { name: "video_gems", amount: 10, secondsSince: 0, secondsPerUnit: 5400, maxAmount: 10, lastGiven: now },
-      { name: "video_coins", amount: 8, secondsSince: 0, secondsPerUnit: 10800, maxAmount: 8, lastGiven: now },
-      { name: "special_video", amount: 3, secondsSince: 0, secondsPerUnit: 28800, maxAmount: 3, lastGiven: now },
-      { name: "skin_charge", amount: 0, secondsSince: 0, secondsPerUnit: 0, maxAmount: 5, lastGiven: now },
-      { name: "skin_purchase", amount: 7, secondsSince: 0, secondsPerUnit: 86400, maxAmount: 7, lastGiven: now },
-      { name: "gem_charge", amount: 0, secondsSince: 0, secondsPerUnit: 0, maxAmount: 3, lastGiven: now },
-      { name: "gem_purchase", amount: 1, secondsSince: 0, secondsPerUnit: 86400, maxAmount: 1, lastGiven: now },
-      { name: "dust", amount: 5000, secondsSince: 0, secondsPerUnit: 0, maxAmount: 0, lastGiven: now },
-      { name: "default_free_spins", amount: 1, secondsSince: 0, secondsPerUnit: 0, maxAmount: 1, lastGiven: new Date(Date.now() - 86400000) },
-      { name: "default_free_ad_spins", amount: 16, secondsSince: 0, secondsPerUnit: 0, maxAmount: 16, lastGiven: new Date(Date.now() - 86400000) },
-      { name: "remove_interstitial_ads", amount: 0, secondsSince: 0, secondsPerUnit: 0, maxAmount: 2, lastGiven: now },
-      { name: "end_of_match", amount: 0, secondsSince: 0, secondsPerUnit: 0, maxAmount: 1, lastGiven: now },
-      { name: "end_of_match_event", amount: 0, secondsSince: 0, secondsPerUnit: 0, maxAmount: 1, lastGiven: now },
-      { name: "tournament_ticket_rare", amount: 0, secondsSince: 0, secondsPerUnit: 0, maxAmount: 0, lastGiven: now },
-      { name: "tournament_ticket_legendary", amount: 0, secondsSince: 0, secondsPerUnit: 0, maxAmount: 0, lastGiven: now },
-      { name: "video_coins_02", amount: 5, secondsSince: 0, secondsPerUnit: 28800, maxAmount: 5, lastGiven: now },
-      { name: "aes", amount: 0, secondsSince: 0, secondsPerUnit: 0, maxAmount: 0, lastGiven: now },
-      { name: "aec", amount: 0, secondsSince: 0, secondsPerUnit: 0, maxAmount: 0, lastGiven: now },
-      { name: "ranked_friend_boost", amount: 3, secondsSince: 0, secondsPerUnit: 86400, maxAmount: 3, lastGiven: now },
-      { name: "stumble_coins", amount: 0, secondsSince: 0, secondsPerUnit: 0, maxAmount: 0, lastGiven: now },
-      { name: "dust_backup", amount: 0, secondsSince: 0, secondsPerUnit: 0, maxAmount: 0, lastGiven: now }
-    ],
-    Rewards: [],
-    availableNewsVersion: 0,
-    latestNewsIdBackend: 11698,
-    battlePass: {
+  static async create(deviceId, platformData = {}) {
+    const now = new Date();
+    const userId = Math.floor(Math.random() * 1000);
+    const username = `StumbleRace<color=orange><sup>#${userId}`;
+
+    const user = {
+      id: userId,
+      deviceId,
+      stumbleId: BackendUtils.generateId().toUpperCase(),
+      username,
+      country: 'RO',
+      region: 'EU',
+      token: CryptoUtils.SessionToken(),
+      version: platformData.Version || '0.99',
+      createdAt: now,
+      lastLogin: now,
+      newsVersion: 0,
+      skillRating: 0,
+      experience: 0,
+      crowns: 0,
+      hiddenRating: 0,
+      isBanned: false,
+      inventory: [{
+        userId,
+        itemId: 803,
+        itemType: "DUPLICATE_BANK",
+        item: "CONFIG_VERSION",
+        amount: 3
+      }],
+      skins: ["SKIN1", "SKIN2"],
+      emotes: ["emote_cry", "emote_hi", "emote_gg", "emote_haha", "emote_happy"],
+      animations: ["animation1"],
+      footsteps: ["footsteps_smoke"],
+      hasBattlePass: false,
+      passTokens: 0,
       freePassRewards: [],
       premiumPassRewards: [],
-      passTokens: 0,
-      hasPurchased: false,
-      passID: 72,
-      secondsToEnd: 904064,
-      experience: 0,
-      slotsClaimed: [],
-      hasUsedDiscount: false,
-      xpBooster: 0,
-      coins: 0,
-      hasUsedBonusDiscount: false,
-      passDateId: 0
-    },
-    secondsSinceCreated: 0,
-    age: 0,
-    kidFriendlyMode: 0,
-    termsOfServiceVersion: 0,
-    xpRoad: {
-      userId,
-      xpRoadId: 0,
-      lastClaimedLevel: 1,
-      isVeteran: true,
-      claimedRewardsIds: [],
-      hasBeenEnabled: true,
-      currentLevelCap: 70,
-      isOnboarding: false,
-      onboardingFeaturesUnlocked: []
-    },
-    userFlags: {
-      hasUsedFreeNameChange: false,
-      hasCoinConversionPopupShown: false,
-      hasCoinConversionCompleted: false
-    },
-    offerSequenceState: [],
-    userProfile: {
-      userId,
-      userName: username,
-      country: ipCountry,
-      trophies: 0,
-      crowns: 0,
-      experience: 0,
-      hiddenRating: 0,
-      isOnline: true,
-      lastSeenDate: now.toISOString(),
-      skin: "SKIN1",
-      nativePlatformName: "android",
-      ranked: {
-        currentSeasonId: "LIVE_RANKED_SEASON_12",
-        currentRankId: 0,
-        currentTierIndex: 0
+      balances: [
+        { name: "coins", amount: 50000, secondsSince: 0, secondsPerUnit: 0, maxAmount: 0, lastGiven: now },
+        { name: "remove_ads", amount: 0, secondsSince: 0, secondsPerUnit: 0, maxAmount: 2, lastGiven: now },
+        { name: "video", amount: 50, secondsSince: 0, secondsPerUnit: 0, maxAmount: 5000, lastGiven: now },
+        { name: "gems", amount: 50000, secondsSince: 0, secondsPerUnit: 0, maxAmount: 0, lastGiven: now },
+        { name: "video_gems", amount: 10, secondsSince: 0, secondsPerUnit: 5400, maxAmount: 10, lastGiven: now },
+        { name: "video_coins", amount: 8, secondsSince: 0, secondsPerUnit: 10800, maxAmount: 8, lastGiven: now },
+        { name: "special_video", amount: 3, secondsSince: 0, secondsPerUnit: 28800, maxAmount: 3, lastGiven: now },
+        { name: "skin_charge", amount: 0, secondsSince: 0, secondsPerUnit: 0, maxAmount: 5, lastGiven: now },
+        { name: "skin_purchase", amount: 7, secondsSince: 0, secondsPerUnit: 86400, maxAmount: 7, lastGiven: now },
+        { name: "gem_charge", amount: 0, secondsSince: 0, secondsPerUnit: 0, maxAmount: 3, lastGiven: now },
+        { name: "gem_purchase", amount: 1, secondsSince: 0, secondsPerUnit: 86400, maxAmount: 1, lastGiven: now },
+        { name: "dust", amount: 0, secondsSince: 0, secondsPerUnit: 0, maxAmount: 0, lastGiven: now },
+        { name: "default_free_spins", amount: 1, secondsSince: 0, secondsPerUnit: 0, maxAmount: 1, lastGiven: new Date(Date.now() - 86400000) },
+        { name: "default_free_ad_spins", amount: 16, secondsSince: 0, secondsPerUnit: 0, maxAmount: 16, lastGiven: new Date(Date.now() - 86400000) },
+        { name: "remove_interstitial_ads", amount: 0, secondsSince: 0, secondsPerUnit: 0, maxAmount: 2, lastGiven: now },
+        { name: "end_of_match", amount: 0, secondsSince: 0, secondsPerUnit: 0, maxAmount: 1, lastGiven: now },
+        { name: "end_of_match_event", amount: 0, secondsSince: 0, secondsPerUnit: 0, maxAmount: 1, lastGiven: now },
+        { name: "tournament_ticket_rare", amount: 0, secondsSince: 0, secondsPerUnit: 0, maxAmount: 0, lastGiven: now },
+        { name: "tournament_ticket_legendary", amount: 0, secondsSince: 0, secondsPerUnit: 0, maxAmount: 0, lastGiven: now },
+        { name: "video_coins_02", amount: 5, secondsSince: 0, secondsPerUnit: 28800, maxAmount: 5, lastGiven: now },
+        { name: "aes", amount: 0, secondsSince: 0, secondsPerUnit: 0, maxAmount: 0, lastGiven: now },
+        { name: "aec", amount: 0, secondsSince: 0, secondsPerUnit: 0, maxAmount: 0, lastGiven: now },
+        { name: "ranked_friend_boost", amount: 3, secondsSince: 0, secondsPerUnit: 86400, maxAmount: 3, lastGiven: now },
+        { name: "stumble_coins", amount: 0, secondsSince: 0, secondsPerUnit: 0, maxAmount: 0, lastGiven: now },
+        { name: "dust_backup", amount: 0, secondsSince: 0, secondsPerUnit: 0, maxAmount: 0, lastGiven: now }
+      ],
+      Rewards: [],
+      availableNewsVersion: 0,
+      latestNewsIdBackend: 11698,
+      battlePass: {
+        freePassRewards: [],
+        premiumPassRewards: [],
+        passTokens: 0,
+        hasPurchased: false,
+        passID: 72,
+        secondsToEnd: 904064,
+        experience: 0,
+        slotsClaimed: [],
+        hasUsedDiscount: false,
+        xpBooster: 0,
+        coins: 50000,
+        hasUsedBonusDiscount: false,
+        passDateId: 0
       },
-      flags: 0
-    },
-    featureFlags: [
-      'TournamentsX',
-      'TournamentsXMeta',
-      'Events',
-      'FriendsList',
-      'GraphicsQualitySettings'
-    ],
-    googleId: platformData.googleId || '',
-    facebookId: platformData.facebookId || '',
-    appleId: platformData.appleId || '',
-    scopelyId: platformData.scopelyId || '',
-    steamTicket: platformData.steamTicket || '',
-    equippedCosmetics: {
-      skin: 'SKIN1',
-      color: 'COLOR1',
-      animation: 'animation1',
-      footsteps: 'footsteps_smoke',
-      emote1: 'emote_cry',
-      emote2: 'emote_hi',
-      emote3: 'emote_gg',
-      emote4: 'emote_haha',
-      actionEmote1: 1,
-      actionEmote2: 2,
-      actionEmote3: 3,
-      actionEmote4: 4
-    },
-    tournamentSeasons: [
-      {
-        seasonId: 67,
-        xp: 0,
-        claimedAwards: []
+      secondsSinceCreated: 0,
+      age: 0,
+      kidFriendlyMode: 0,
+      termsOfServiceVersion: 0,
+      xpRoad: {
+        userId,
+        xpRoadId: 0,
+        lastClaimedLevel: 1,
+        isVeteran: true,
+        claimedRewardsIds: [],
+        hasBeenEnabled: true,
+        currentLevelCap: 70,
+        isOnboarding: false,
+        onboardingFeaturesUnlocked: []
+      },
+      userFlags: {
+        hasUsedFreeNameChange: false,
+        hasCoinConversionPopupShown: false,
+        hasCoinConversionCompleted: false
+      },
+      offerSequenceState: [],
+      userProfile: {
+        userId,
+        userName: username,
+        country: 'RO',
+        trophies: 0,
+        crowns: 0,
+        experience: 0,
+        hiddenRating: 0,
+        isOnline: true,
+        lastSeenDate: now.toISOString(),
+        skin: "SKIN1",
+        nativePlatformName: "android",
+        ranked: {
+          currentSeasonId: "LIVE_RANKED_SEASON_12",
+          currentRankId: 0,
+          currentTierIndex: 0
+        },
+        flags: 0
+      },
+      featureFlags: [
+        "ActionEmotes",
+        "ActionEmotesCustomPartyVisibility",
+        "age-request",
+        "AssignInitialPhotonRegionBasedOnPing",
+        "AutomatedShardSources",
+        "AvailableCosmetics",
+        "BattlePassActivationButton",
+        "BattlePassOffer",
+        "BattlePassPremiumPopupImprovement",
+        "BattlePassSkipButtonOnSections",
+        "BattlePassTheme",
+        "BattlePassV2",
+        "Consensus",
+        "ConsoleFreeSpin",
+        "CreatorCodes",
+        "CreatorsQR",
+        "CustomizeEmotesOnCustomPartyLobby",
+        "CustomParty",
+        "DeltaSharedConfig",
+        "DiscoverabilityEvents",
+        "DynamicContainer",
+        "EndOfMatchRewardedVideo",
+        "Events",
+        "FriendsList",
+        "GameplayAds",
+        "GamePlayInGameNotifications",
+        "GlobalLTCMetaEvent",
+        "GraphicsQualitySettings",
+        "HelpshiftConversation",
+        "InAppMessageGifting",
+        "LateJoinResyncSystem",
+        "Leaderboards",
+        "LocalNotifications",
+        "LootBoxes",
+        "MainMenuRevamp",
+        "MatchmakingFilter",
+        "MemoryFixesSections",
+        "MergeParties",
+        "Missions",
+        "NewMatchmaking",
+        "Offerwall",
+        "OldPurchaserImplementation",
+        "OneStopShop",
+        "OneStopShop3dAnimations",
+        "OneStopShop3dSkins",
+        "OneStopShop3dTaunts",
+        "PluginFactory",
+        "ProjectVerano",
+        "Pusher",
+        "QuantumSystemManagement",
+        "Ranked",
+        "RankedPlayWithFriends",
+        "RemoteLocalizations",
+        "RoomManagement",
+        "RoomManagementConsole",
+        "SavePhotonRegionOnBackend",
+        "ScopelyAccount",
+        "ScopelyAccountApple",
+        "SequentialOffers",
+        "Shards",
+        "ShardsDuplicateBank",
+        "ShopOfferCentering",
+        "ShopOfferPurchaseLimitIndicator",
+        "SimulationGamePayload",
+        "SpecialEmoteFilter",
+        "StartupNewFlow",
+        "StaticBundles",
+        "SteamInventory",
+        "TransferAppleIdAuthorization",
+        "UsePhotonTicketsEvents",
+        "UsePhotonTicketsTournamentsX",
+        "UserConfiguration",
+        "UserGeneratedContent",
+        "UserTimeRecords",
+        "WebGLRealMoneyOffers",
+        "WorkshopCustomThumbnails",
+        "XpRoad"
+      ],
+      googleId: platformData.googleId || '',
+      facebookId: platformData.facebookId || '',
+      appleId: platformData.appleId || '',
+      scopelyId: platformData.scopelyId || '',
+      steamTicket: platformData.steamTicket || '',
+      equippedCosmetics: {
+        skin: 'SKIN1',
+        color: 'COLOR1',
+        animation: 'animation1',
+        footsteps: 'footsteps_smoke',
+        emote1: 'emote_cry',
+        emote2: 'emote_hi',
+        emote3: 'emote_gg',
+        emote4: 'emote_haha',
+        actionEmote1: 1,
+        actionEmote2: 2,
+        actionEmote3: 3,
+        actionEmote4: 4
       }
-    ]
-  };
+    };
 
-  return await database.createUser(user);
-}
- 
+    return await database.createUser(user);
+  }
+
 
   static async findByDeviceId(deviceId) {
     return await database.getUserByQuery({ deviceId });
@@ -589,6 +566,9 @@ class UserModel {
       .limit(parseInt(count))
       .toArray();
 
+    if (users.length === 0) {
+      return { Error: "No users found" };
+    }
 
     const scores = users.map(user => {
       const value = type === "crowns" ? user.crowns : user.skillRating;
@@ -614,88 +594,35 @@ class UserModel {
   }
 }
 
-
-
-  async function authenticate(req, res, next) {
+async function authenticate(req, res, next) {
   try {
     const authHeader = req.headers.authorization;
     req.user = null;
 
-    if (req.path == "/user/login" || req.path == "/user/config" || req.path == "/photon/get") {
+    if (!authHeader) {
       return next();
     }
-   
-     if (!authHeader)
-    {
-      return res.status(401).json("naocara");
-    } 
- 
-    let authData = {};
+
+    let authData;
     try {
       authData = JSON.parse(authHeader);
-      if (authData && authData.Encrypted) {
-        const decrypted = CryptoUtils.Decrypt(authData.Encrypted);
-        authData = JSON.parse(decrypted);
-      }
-    } catch (e) { 
-      try {
-        const decrypted = CryptoUtils.Decrypt(authHeader);
-        authData = JSON.parse(decrypted);
-      } catch (err) {
-        Console.error("Auth", "Error parsing authorization header:", e);
-        return next();
-      }
+    } catch (e) {
+      return next();
     }
 
-    const deviceId = authData.DeviceId || "";
-    const stumbleId = authData.StumbleId || "";
-    const token = authData.Token || "";
-    const hash = authData.Hash || "";
-    const username = authData.Username || "";
-    const id = authData.Id || "";
+    const { DeviceId, StumbleId } = authData;
 
-
-    const expectedHash = CryptoUtils.CreateRegularHash(
-      username,
-      id,
-      deviceId,
-      token,
-      stumbleId,
-      req.path,
-      JSON.stringify(req.body)
-    );
-
-     if (hash !== expectedHash) {
-      Console.warn("Auth", "Hash inválida para usuário: " + (stumbleId || deviceId));
-      return res.status(401).json("UNAUTHORIZED");
-     }
-
-    let user = stumbleId 
-      ? await UserModel.findByStumbleId(stumbleId)
-      : await UserModel.findByDeviceId(deviceId);
-
-     if (!user) {
-      Console.log("Auth", `User not found: DeviceId=${deviceId}, StumbleId=${stumbleId}`);
-      Console.log("Auth", `User not found: ${expectedHash}`);
-      return res.status(404).json("usuario nao encontrado");
-    }
-
-    if (user.isBanned)
-    {
-        return res.status(403).json("BANNED");
-    }
+    const user = StumbleId
+      ? await UserModel.findByStumbleId(StumbleId)
+      : await UserModel.findByDeviceId(DeviceId);
 
     req.user = user;
-
-    Console.log("Auth", `Authenticated user: ${user.username}`);
     next();
   } catch (err) {
-    Console.error("Auth", "Error:", err);
-    res.status(401).json("UNAUTHORIZED");
+    console.error('Auth error:', err);
+    res.status(500).json({ error: 'Server error' });
   }
 }
-
-
 
 async function generatePhotonJwt(user) {
   const payload = {
@@ -704,8 +631,8 @@ async function generatePhotonJwt(user) {
     username: user.username
   };
 
-  const secret = process.env.Salt;
-  const options = { expiresIn: '30d', issuer: 'JWTPhoton' };
+  const secret = process.env.LeagueSalt;
+  const options = { expiresIn: '30d', issuer: 'StumbleLeaguePhoton' };
 
   return new Promise((resolve, reject) => {
     jwt.sign(payload, secret, options, (err, token) => {
@@ -715,8 +642,6 @@ async function generatePhotonJwt(user) {
   });
 }
 
-
-
 async function VerifyPhoton(req, res, user) {
   try {
     const tokenFromHeader = req.headers.authorization;
@@ -725,11 +650,11 @@ async function VerifyPhoton(req, res, user) {
     }
 
     try {
-      const secret = process.env.Salt;
+      const secret = process.env.LeagueSalt;
       const decoded = jwt.verify(tokenFromHeader, secret);
-      
-      if (decoded.stumbleId !== user.stumbleId || 
-          decoded.deviceId !== user.deviceId || 
+
+      if (decoded.stumbleId !== user.stumbleId ||
+          decoded.deviceId !== user.deviceId ||
           decoded.username !== user.username) {
         return res.json({ ResultCode: -1, Message: "Token validation failed" });
       }
@@ -744,178 +669,65 @@ async function VerifyPhoton(req, res, user) {
   }
 }
 
-
-
 class UserController {
-  static loginAttempts = new Map();
-  static bannedIPs = new Map();
-  static bannedDevices = new Map();
-
-
-static async login(req, res) {
+  static async login(req, res) {
     try {
-      const { DeviceId, StumbleId, Version } = req.body;
-      if (!DeviceId) return res.status(400).json({ error: 'deviceid required' });
+      const { DeviceId, StumbleId, SteamTicket, ScopelyId, Version, newUsername } = req.body;
 
-      const clientIp = req.headers["x-real-ip"] || req.ip;
-      
-      if (UserController.bannedIPs.has(clientIp)) {
-        const banInfo = UserController.bannedIPs.get(clientIp);
-        if (Date.now() < banInfo.until) {
-          return res.status(429).json({ error: 'a' });
-        }
-        UserController.bannedIPs.delete(clientIp);
+      if (!DeviceId) {
+        return res.status(400).json({ message: 'DeviceId is required' });
       }
 
-      if (UserController.bannedDevices.has(DeviceId)) {
-        const banInfo = UserController.bannedDevices.get(DeviceId);
-        if (Date.now() < banInfo.until) {
-          return res.status(429).json({ error: 'a' });
-        }
-        UserController.bannedDevices.delete(DeviceId);
+      let user = null;
+      if (StumbleId) {
+        user = await UserModel.findByStumbleId(StumbleId);
       }
-
-      let user = await UserModel.findByStumbleId(StumbleId);
-      if (!user) user = await UserModel.findByDeviceId(DeviceId);
 
       if (!user) {
-        const now = Date.now();
-        const attempts = UserController.loginAttempts.get(clientIp) || { count: 0, lastAttempt: now, deviceAttempts: {} };
-        
-        if (now - attempts.lastAttempt > 60000) {
-          attempts.count = 0;
-          attempts.deviceAttempts = {};
-        }
-        
-        attempts.count++;
-        attempts.lastAttempt = now;
-        
-        if (!attempts.deviceAttempts[DeviceId]) {
-          attempts.deviceAttempts[DeviceId] = 1;
-        } else {
-          attempts.deviceAttempts[DeviceId]++;
-        }
-        
-        UserController.loginAttempts.set(clientIp, attempts);
-        
-        if (attempts.count > 5 || attempts.deviceAttempts[DeviceId] > 3) {
-          UserController.bannedIPs.set(clientIp, {
-            until: now + 15 * 60 * 1000,
-            bannedAt: now
-          });
-          
-          UserController.bannedDevices.set(DeviceId, {
-            until: now + 15 * 60 * 1000,
-            bannedAt: now
-          });
-          
-          return res.status(429).json({ error: 'a' });
-        }
-        
-        user = await UserModel.create(req.ip, DeviceId, { Version });
-      } else {
-        if (user.isBanned) return res.status(403).json("BANNED");
-        
-        UserController.loginAttempts.delete(clientIp);
-        
-        user = await UserModel.update(user.stumbleId, {
-          lastLogin: new Date(),
-          version: Version
-        });
+        user = await UserModel.findByDeviceId(DeviceId);
       }
 
-      const token = CryptoUtils.SessionToken();
+      if (!user) {
+        Console.log("Login", "Criando novo usuario com o deviceId: " + DeviceId);
+        user = await UserModel.create(DeviceId, { steamTicket: SteamTicket, scopelyId: ScopelyId, Version });
+      }
+
+      // Se foi enviado um newUsername, atualizar o username do usuário
+      if (newUsername && newUsername !== user.username) {
+        // Validação básica do username
+        if (!/^[a-zA-Z0-9_\s]+$/.test(newUsername)) {
+          return res.status(422).json({ message: 'Username can only contain letters, numbers, underscores and spaces' });
+        }
+
+        if (newUsername.length < 3 || newUsername.length > 15) {
+          return res.status(422).json({ message: 'Username must be between 3 and 15 characters' });
+        }
+
+        // Verificar se o username já existe
+        const existingUser = await database.getUserByQuery({ username: newUsername });
+        if (existingUser && existingUser._id.toString() !== user._id.toString()) {
+          return res.status(409).json({ message: 'Username already taken' });
+        }
+
+        // Atualizar o username no banco de dados
+        user = await UserModel.update(user.stumbleId, { username: newUsername });
+        Console.log("Login", "Username atualizado para: " + newUsername + " para usuario: " + user.stumbleId);
+      }
+
       const photonJwt = await generatePhotonJwt(user);
 
-      user = await UserModel.update(user.stumbleId, { token, photonJwt });
+     if (user.isBanned) {
+  return res.status(403).send("BANNED");
+}
 
-const featureFlags = [
-        'ActionEmotes',
-        'ActionEmotesCustomPartyVisibility',
-        'AssignInitialPhotonRegionBasedOnPing',
-        'AutomatedShardSources',
-        'AvailableCosmetics',
-        'BattlePassActivationButton',
-        'BattlePassOffer',
-        'BattlePassPremiumPopupImprovement',
-        'BattlePassSkipButtonOnSections',
-        'BattlePassTheme',
-        'BattlePassV2',
-        'Consensus',
-        'ConsoleFreeSpin',
-        'CreatorCodes',
-        'CreatorsQR',
-        'CustomizeEmotesOnCustomPartyLobby',
-        'CustomParty',
-        'DeltaSharedConfig',
-        'DiscoverabilityEvents',
-        'DynamicContainer',
-        'EndOfMatchRewardedVideo',
-        'Events',
-        'FriendsList',
-        'GameplayAds',
-        'GamePlayInGameNotifications',
-        'GlobalLTCMetaEvent',
-        'GraphicsQualitySettings',
-        'HelpshiftConversation',
-        'InAppMessageGifting',
-        'LateJoinResyncSystem',
-        'Leaderboards',
-        'LocalNotifications',
-        'LootBoxes',
-        'MainMenuRevamp',
-        'MatchmakingFilter',
-        'MemoryFixesSections',
-        'MergeParties',
-        'NewMatchmaking',
-        'Offerwall',
-        'OldPurchaserImplementation',
-        'OneStopShop',
-        'OneStopShop3dAnimations',
-        'OneStopShop3dSkins',
-        'OneStopShop3dTaunts',
-        'PluginFactory',
-        'ProjectVerano',
-        'Pusher',
-        'QuantumSystemManagement',
-        'RemoteLocalizations',
-        'RoomManagement',
-        'RoomManagementConsole',
-        'ScopelyAccount',
-        'ScopelyAccountApple',
-        'IPL_056_Dancefloor',
-        'SequentialOffers',
-        'Shards',
-        'ShardsDuplicateBank',
-        'ShopOfferCentering',
-        'ShopOfferPurchaseLimitIndicator',
-        'SimulationGamePayload',
-        'SpecialEmoteFilter',
-        'StartupNewFlow',
-        'StaticBundles',
-        'SteamInventory',
-        'TransferAppleIdAuthorization',
-        'UsePhotonTicketsEvents',
-        'UsePhotonTicketsTournamentsX',
-        'UserConfiguration',
-        'UserGeneratedContent',
-        'UserTimeRecords',
-        'WebGLRealMoneyOffers',
-        'WorkshopCustomThumbnails',
-        'XpRoad',
-        'TournamentsX',
-        'TournamentsXMeta'
-      ]
-      Console.log("Login", "User Logged: " + user.username);
       return res.status(200).json({
         User: user,
         PhotonJwt: photonJwt,
-        featureFlags: featureFlags
+        equippedCosmetics: user.equippedCosmetics
       });
-
     } catch (err) {
       Console.error('Login', 'Error:', err);
-      return res.status(500).json({ error: 'internal server error' });
+      return res.status(500).json({ message: 'Internal server error during login' });
     }
   }
 
@@ -949,67 +761,34 @@ const featureFlags = [
       res.status(500).json({ message: 'Internal server error' });
     }
   }
-   
-    static async updateUsername(req, res) {
+
+static async updateUsername(req, res) {
   try {
     const { Username } = req.body;
     const { user } = req;
 
-    if (!Username || Username.length < 3 || Username.length > 12) {
-      return res.status(401).json({ message: 'so pode ter de 3 a 12 carater' });
+    // Validação do formato do username
+    if (!/^[a-zA-Z0-9_\s]+$/.test(Username)) {
+      res.status(422).json({ message: 'Username can only contain letters, numbers, underscores and spaces' });
+      return;
     }
 
-    if (/[<>{}\[\]()"'\`~#$%^&*=+\\\/|:;,?!]/.test(Username)) {
-      return res.status(403).json({ message: 'caracteres invalidos' });
-    }
-
+    // Verifica se o username já existe
     const existingUser = await database.getUserByQuery({ username: Username });
     if (existingUser) {
-      return res.status(409).json({ message: 'Username already taken' });
+      res.status(409).json({ message: 'Username already taken' });
+      return;
     }
 
-    const tagItems = user.inventory
-      ? user.inventory.filter(i => i.itemType === "TAG" && typeof i.item === "string")
-      : [];
-
-    const tagsToAdd = tagItems.map(t => {
-      let tag = t.item.replace(/^tag_/, '');
-      if (t.amount > 1) tag += `+${t.amount}`;
-      return tag;
-    });
-
-    let finalUsername = Username;
-
-    if (tagsToAdd.length > 0) {
-      finalUsername += " " + tagsToAdd.join(" ");
-    }
-
-    const oldNames = Array.isArray(user.oldNames) ? user.oldNames : [];
-    oldNames.push({
-      name: user.username,
-      changedAt: new Date()
-    });
-
-    const updates = {
-      username: finalUsername,
-      "userProfile.userName": finalUsername,
-      oldNames: oldNames
-    };
-
-    const updatedUser = await UserModel.update(user.stumbleId, updates);
-    await UserModel.removeBalance(user.deviceId, "gems", 100);
-
-    console.log(`${user.username} changed username to ${finalUsername}`);
-
+    // Se todas as validações passarem, atualiza o usuário
+    const updatedUser = await UserModel.update(user.stumbleId, { username: Username });
     res.status(200).json({ User: updatedUser });
 
   } catch (err) {
-    console.error("error updating username:", err);
-    res.status(500).json({ message: "internal server error" });
+    console.error('Username', 'Update error:', err);
+    res.status(500).json({ message: 'Internal server error' });
   }
 }
-
-
 
 
   static async getSettings(req, res) {
@@ -1020,7 +799,7 @@ const featureFlags = [
             partyInviteToastNotification: true,
             partyInviteInGameToastNotification: true
         };
-        
+
         res.json(settings);
     } catch (err) {
         Console.error('Settings', 'Error:', err);
@@ -1041,7 +820,7 @@ const featureFlags = [
         return res.status(404).json({ message: 'User not found' });
       }
 
-      res.json({ 
+      res.json({
         User: user.userProfile
       });
     } catch (err) {
@@ -1054,8 +833,6 @@ const featureFlags = [
     try {
       const { user } = req;
       const { skinId } = req.body;
-
-     console.log("skin", req.body);
 
       if (!skinId) {
         return res.status(400).json({ message: 'skinId is required' });
@@ -1072,64 +849,28 @@ const featureFlags = [
 
   static async setEquippedCosmetic(req, res) {
     try {
-        const { user } = req;
-        const { Category, ItemId } = req.body;
+      const { user } = req;
+      const { cosmeticType, cosmeticId } = req.body;
 
-        if (!Category || !ItemId) {
-            return res.status(400).json({ message: 'falta algo' });
-        }
+      if (!cosmeticType || !cosmeticId) {
+        return res.status(400).json({ message: 'Both cosmeticType and cosmeticId are required' });
+      }
 
-        const updates = {
-            equippedCosmetics: {
-                ...user.equippedCosmetics,
-                [Category]: ItemId
-            }
-        };
-
-        if (Category === 'Skin') {
-            updates['userProfile.skin'] = ItemId;
-        }
-
-        const updatedUser = await database.updateUser({ stumbleId: user.stumbleId }, updates);
-        res.json({ User: updatedUser });
+      const updatedUser = await UserModel.setEquippedCosmetic(user.stumbleId, cosmeticType, cosmeticId);
+      res.json({ User: updatedUser });
     } catch (err) {
-        Console.error('Cosmetics', 'erro ao setar cosméticos:', err);
-        res.status(500).json({ message: 'erro' });
+      Console.error('Cosmetics', 'Set equipped error:', err);
+      res.status(500).json({ message: 'Internal server error' });
     }
-}
-   
-   
- static async getHighscore(req, res, next) {
-  try {
-    const { type } = req.params;
-    const { start = 0, count = 100, country = 'global' } = req.query;
-
-    const startNum = parseInt(start, 10);
-    const countNum = parseInt(count, 10);
-
-    if (!type) {
-      return res.status(400).json({ error: "O tipo é necessário" });
-    }
-
-    if (isNaN(startNum) || isNaN(countNum)) {
-      return res.status(400).json({ error: "Os parâmetros start e count devem ser números" });
-    }
-
-    const result = await UserModel.GetHighscore(type, country, startNum, countNum);
-
-    res.json(result);
-  } catch (err) {
-    next(err);
   }
-   }
 
   static async updateCosmetics(req, res) {
     try {
       const { user } = req;
-      const { 
-        skin, color, animation, footsteps, 
+      const {
+        skin, color, animation, footsteps,
         emote1, emote2, emote3, emote4,
-        actionEmote1, actionEmote2, actionEmote3, actionEmote4 
+        actionEmote1, actionEmote2, actionEmote3, actionEmote4
       } = req.body;
 
       const updates = {
@@ -1160,12 +901,12 @@ const featureFlags = [
   static async deleteAccount(req, res) {
     try {
       const { user } = req;
-      const newUsername = `#${CryptoUtils.GenCaracters(11)}`;
-      
+      const newUsername = `#${BackendUtils.GenCaracters(11)}`;
+
       await UserModel.update(user.deviceId, { username: newUsername });
       await database.collections.Users.deleteOne({ deviceId: user.deviceId });
-      
-      res.json({ message: 'tchauuuuuuu brigado' });
+
+      res.json({ message: 'Account deleted successfully' });
     } catch (err) {
       Console.error('Account', 'Delete error:', err);
       res.status(500).json({ message: 'Internal server error' });
@@ -1176,13 +917,13 @@ const featureFlags = [
     try {
       const { platform, platformId } = req.body;
       const { user } = req;
-      
+
       const validPlatforms = ['google', 'apple', 'facebook', 'scopely'];
       if (!validPlatforms.includes(platform)) {
         return res.status(400).json({ message: 'Invalid platform' });
       }
 
-      const platformIdMD5 = CryptoUtils.Hash('md5', platformId || `${platform}-${user.username}-${process.env.Salt}`);
+      const platformIdMD5 = BackendUtils.Hash('md5', platformId || `${platform}-${user.username}-${process.env.LeagueSalt}`);
       const updateField = `${platform}Id`;
 
       const updatedUser = await UserModel.update(user.deviceId, { [updateField]: platformIdMD5 });
@@ -1197,7 +938,7 @@ const featureFlags = [
     try {
       const { platform } = req.body;
       const { user } = req;
-      
+
       const validPlatforms = ['google', 'apple', 'facebook', 'scopely'];
       if (!validPlatforms.includes(platform)) {
         return res.status(400).json({ message: 'Invalid platform' });
@@ -1205,7 +946,7 @@ const featureFlags = [
 
       const updateField = `${platform}Id`;
       const updatedUser = await UserModel.update(user.deviceId, { [updateField]: '' });
-      
+
       res.json({ User: updatedUser, message: `Successfully unlinked ${platform} account` });
     } catch (err) {
       Console.error('Platform', 'Unlink error:', err);
@@ -1218,12 +959,15 @@ class RoundController {
   static async finishRound(req, res) {
     try {
       const { user } = req;
-      const { Round } = req.body;
+      const { round } = req.params;
 
+      if (!round) {
+        return res.status(400).json({ message: 'Round is required' });
+      }
 
       const rewards = {
-        crowns: Round === '3' ? 1 : Round === '2' ? 0 : 0,
-        skillRating: Round === '3' ? 20 : Round === '2' ? 10 : 0,
+        crowns: round === '3' ? 1 : round === '2' ? 0 : 0,
+        skillRating: round === '3' ? 20 : round === '2' ? 10 : 0,
         experience: 100
       };
 
@@ -1234,6 +978,7 @@ class RoundController {
       });
 
       res.status(200).json({
+        User: updatedUser,
         Rewards: rewards
       });
     } catch (err) {
@@ -1246,7 +991,7 @@ class RoundController {
     try {
       const { user } = req;
       const { round } = req.params;
-Console.log('Round', `Finishing custom round: ${round} for user: ${user.username}`);
+
       res.json({
         User: user,
         message: 'Custom round finished successfully'
@@ -1263,7 +1008,7 @@ Console.log('Round', `Finishing custom round: ${round} for user: ${user.username
       const { round } = req.params;
       const { gameType, variantId } = req.body;
 
-      const gameId = CryptoUtils.CreateGameId(gameType === 'event' ? 'event' : 'regular');
+      const gameId = BackendUtils.createGameId(gameType === 'event' ? 'event' : 'regular');
       const levelIds = SharedData.RoundLevels_v2.map(level => level.LevelID).slice(0, 3);
 
       const roundPayloads = {};
@@ -1365,114 +1110,6 @@ Console.log('Round', `Finishing custom round: ${round} for user: ${user.username
       res.status(500).json({ message: 'Internal server error' });
     }
   }
-
-  static async finishEventRoundV3(req, res) {
-    try {
-      const { user } = req;
-      const { region, appid, jwt, eventId } = req.params;
-      const finishReq = req.body || {};
-
-      if (!eventId) {
-        return res.status(400).json({ message: "eventId requerido" });
-      }
-
-      const events = SharedData.GameEvents || [];
-      const event = events.find(e => e.Id === eventId);
-      if (!event) {
-        return res.status(404).json({ message: "evento nao encontrado" });
-      }
-
-      const now = new Date();
-      const start = new Date(event.StartDateTime);
-      const end = new Date(event.EndDateTime);
-      if (!(start <= now && now <= end)) {
-        return res.status(400).json({ message: "evento nao esta ativo" });
-      }
-
-      const roundNumber = parseInt(finishReq.Round ?? finishReq.round);
-      if (isNaN(roundNumber)) {
-        return res.status(400).json({ message: "round invalido" });
-      }
-
-      const roundDef = Array.isArray(event.EventRounds)
-        ? event.EventRounds.find(r => r.RoundNumber === roundNumber) || event.EventRounds[0]
-        : null;
-
-      if (!roundDef) {
-        return res.status(400).json({ message: "round nao configurado para evento" });
-      }
-
-      let xp = 0;
-      let passTokens = 0;
-      let trophies = 0;
-      let crowns = 0;
-      let hiddenRatingDelta = 0;
-
-      const rewardsList = Array.isArray(roundDef.RoundRewards) ? roundDef.RoundRewards : [];
-      for (const r of rewardsList) {
-        const amount = typeof r.max === "number" ? r.max : (typeof r.min === "number" ? r.min : 0);
-        if (r.type === "XP") xp += amount;
-        else if (r.type === "PASSTOKENS") passTokens += amount;
-        else if (r.type === "TROPHIES") trophies += amount;
-        else if (r.type === "CROWNS") crowns += amount;
-      }
-
-      const winnerRewardsList = Array.isArray(event.WinnerRewards?.Rewards) ? event.WinnerRewards.Rewards : [];
-      for (const r of winnerRewardsList) {
-        const amount = typeof r.max === "number" ? r.max : (typeof r.min === "number" ? r.min : 0);
-        if (r.type === "XP") xp += amount;
-        else if (r.type === "PASSTOKENS") passTokens += amount;
-        else if (r.type === "TROPHIES") trophies += amount;
-        else if (r.type === "CROWNS") crowns += amount;
-      }
-      if (typeof event.WinnerHiddenRating === "number") {
-        hiddenRatingDelta += event.WinnerHiddenRating;
-      }
-
-      const currentCrowns = parseInt(user.userProfile?.crowns ?? user.crowns ?? 0) || 0;
-      const currentExperience = parseInt(user.userProfile?.experience ?? user.experience ?? 0) || 0;
-      const currentTrophies = parseInt(user.userProfile?.trophies ?? 0) || 0;
-      const currentSkill = parseInt(user.skillRating ?? 0) || 0;
-      const currentPassTokens = parseInt(user.battlePass?.passTokens ?? user.passTokens ?? 0) || 0;
-
-      const updatedUserProfile = {
-        ...(user.userProfile || {}),
-        crowns: Math.max(0, currentCrowns + crowns),
-        experience: Math.max(0, currentExperience + xp),
-        trophies: Math.max(0, currentTrophies + trophies)
-      };
-
-      const updatedBattlePass = {
-        ...(user.battlePass || {}),
-        passTokens: Math.max(0, currentPassTokens + passTokens)
-      };
-
-      const updatedUser = await UserModel.update(user.stumbleId, {
-        crowns: Math.max(0, (user.crowns || 0) + crowns),
-        experience: Math.max(0, (user.experience || 0) + xp),
-        skillRating: Math.max(0, currentSkill + trophies + hiddenRatingDelta),
-        passTokens: Math.max(0, (user.passTokens || 0) + passTokens),
-        battlePass: updatedBattlePass,
-        userProfile: updatedUserProfile
-      });
-
-      return res.status(200).json({
-        EventId: eventId,
-        Region: region,
-        Rewards: {
-          XP: xp,
-          PASSTOKENS: passTokens,
-          TROPHIES: trophies,
-          CROWNS: crowns
-        },
-        UpdatedUser: updatedUser,
-        SignedPayload: finishReq.SignedPayload || ""
-      });
-    } catch (err) {
-      Console.error("GameEvents", "FinishV3 error:", err);
-      return res.status(500).json({ message: "erro interno" });
-    }
-  }
 }
 
 class BattlePassController {
@@ -1486,13 +1123,11 @@ class BattlePassController {
       });
 
       if (!activePass) {
-        Console.log("BattlePass", `No active battle pass found`);
         return res.status(404).json({ message: 'No active battle pass found' });
       }
 
       const battlePass = SharedData.BattlePasses.find(bp => bp.PassID === activePass.PassID);
       if (!battlePass) {
-        Console.log("BattlePass", `Battle pass data not found for PassID: ${activePass.PassID}`);
         return res.status(404).json({ message: 'Battle pass data not found' });
       }
 
@@ -1507,21 +1142,19 @@ class BattlePassController {
     try {
       const { user } = req;
       const { Page, Section, Slot, IsPremium } = req.body;
-      
+
       if (Page === undefined || Section === undefined || Slot === undefined) {
-        Console.log("BattlePass", `Invalid claim request: ${JSON.stringify(req.body)}`);
         return res.status(400).json({ message: 'Page, Section and Slot are required' });
       }
 
       const slotKey = `${Page},${Section},${Slot}`;
       if (user.battlePass.slotsClaimed.includes(slotKey)) {
-        Console.log("BattlePass", `Slot already claimed: ${slotKey}`);
         return res.status(400).json({ message: 'Slot already claimed' });
       }
 
       await database.collections.Users.updateOne(
         { deviceId: user.deviceId },
-        { $push: { 'battlePass.slotsClaimed': slotKey } }  
+        { $push: { 'battlePass.slotsClaimed': slotKey } }
       );
 
       const updatedUser = await UserModel.findByDeviceId(user.deviceId);
@@ -1537,13 +1170,11 @@ class BattlePassController {
       const { user } = req;
 
       if (user.battlePass.hasPurchased) {
-        Console.log("BattlePass", `User already purchased battle pass: ${user.deviceId}`);
         return res.status(400).json({ message: 'Battle pass already purchased' });
       }
 
       const gemsBalance = UserModel.getBalanceAmount(user, 'gems');
       if (gemsBalance < 1200) {
-        Console.log("BattlePass", `Not enough gems to purchase battle pass: ${user.deviceId}`);
         return res.status(400).json({ message: 'Not enough gems' });
       }
 
@@ -1564,7 +1195,6 @@ class BattlePassController {
       const battlePass = SharedData.BattlePasses[0];
 
       if (!battlePass) {
-        Console.log("BattlePass", `No battle pass data available`);
         return res.status(404).json({ message: 'No battle pass data available' });
       }
 
@@ -1613,89 +1243,44 @@ class EconomyController {
       const { user } = req;
       const itemId = req.params.item;
 
-      Console.log('Economy', `purchase start: user=${user.stumbleId} item=${itemId}`);
-
       const item = SharedData.PurchasableItems.find(i => i.Name === itemId);
-      if (!item) {
-        Console.error('Economy', `purchase item not found: ${itemId}`);
-        return res.status(404).json({ error: 'ITEM_NOT_FOUND' });
-      }
+      if (!item) return res.status(404).json({ error: 'ITEM_NOT_FOUND' });
 
-      const price = (item.prices && item.prices[0]) || (item.Prices && item.Prices[0]) || null;
-      if (!price) {
-        Console.error('Economy', `purchase invalid price for item=${itemId}`);
-        return res.status(400).json({ error: 'INVALID_PRICE' });
-      }
+      const price = item.Prices[0];
+      if (!price) return res.status(400).json({ error: 'INVALID_PRICE' });
 
-      const currency = price.currency || price.Currency;
-      const amount = price.amount || price.Amount || 0;
+      const balance = UserModel.getBalanceAmount(user, price.Currency);
+      if (balance < price.Amount) return res.status(402).json({ error: 'INSUFFICIENT_FUNDS' });
 
-      if (currency && currency !== 'iap') {
-        const balance = UserModel.getBalanceAmount(user, currency);
-        Console.log('Economy', `purchase price: currency=${currency} amount=${amount} balance=${balance}`);
-        if (balance < amount) return res.status(402).json({ error: 'INSUFFICIENT_FUNDS' });
-        await UserModel.removeBalance(user.deviceId, currency, amount);
-      } else {
-        Console.log('Economy', `purchase via IAP or free: currency=${currency} amount=${amount}`);
-      }
+      await UserModel.removeBalance(user.stumbleId, price.Currency, price.Amount);
 
       const rewards = [];
-      const itemRewards = item.rewards || item.Rewards || [];
-      for (const reward of itemRewards) {
-        const type = (reward.type || reward.Type || '').toUpperCase();
-        const typeInfo = reward.typeInfo || reward.CosmeticId || reward.CurrencyType || reward.CosmeticType || '';
-        const rewardAmount = reward.amount || reward.Amount || reward.min || 1;
-
-        if (type === 'CURRENCY') {
-          await UserModel.addBalance(user.deviceId, typeInfo, rewardAmount);
-          rewards.push({ type: 'CURRENCY', typeInfo, amount: rewardAmount });
-        } else if (type === 'SKIN') {
-          await UserModel.addSkin(user.stumbleId, typeInfo);
-          rewards.push({ type: 'SKIN', typeInfo });
-        } else if (type === 'ACTION_EMOTE') {
-          await database.addToUserArray({ stumbleId: user.stumbleId }, 'actionEmotes', typeInfo);
-          rewards.push({ type: 'ACTION_EMOTE', typeInfo });
-        } else if (type === 'EMOTE') {
-          await database.addToUserArray({ stumbleId: user.stumbleId }, 'emotes', typeInfo);
-          rewards.push({ type: 'EMOTE', typeInfo });
-        } else if (type === 'COSMETIC') {
-          await UserModel.addSkin(user.stumbleId, typeInfo);
-          rewards.push({ type: 'COSMETIC', typeInfo });
+      if (item.Rewards) {
+        for (const reward of item.Rewards) {
+          if (reward.Type === 'Currency') {
+            await UserModel.addBalance(user.stumbleId, reward.CurrencyType, reward.Amount);
+            rewards.push({
+              type: 'CURRENCY',
+              currencyType: reward.CurrencyType,
+              amount: reward.Amount
+            });
+          } else if (reward.Type === 'Cosmetic') {
+            await UserModel.addSkin(user.stumbleId, reward.CosmeticId);
+            rewards.push({
+              type: 'COSMETIC',
+              cosmeticType: reward.CosmeticType,
+              cosmeticId: reward.CosmeticId
+            });
+          }
         }
       }
-    
+
       const updatedUser = await UserModel.findByStumbleId(user.stumbleId);
-
-      
-      const featureFlagsWorking = [
-        'age-request',
-        'Consensus',
-        'CustomParty',
-        'EndOfMatchRewardedVideo',
-        'GamePlayInGameNotifications',
-        'HelpshiftConversation',
-        'LocalNotifications',
-        'MatchmakingFilter',
-        'NewMatchmaking',
-        'Pusher',
-        'TournamentsX',
-        'TournamentsXMeta',
-        'QuantumSystemManagement',
-        'RemoteLocalizations',
-        'RoomManagementConsole',
-        'TransferAppleIdAuthorization'
-      ];
-
-      const response = {
-        FeatureFlags: featureFlagsWorking,
-        PhotonJwt: "",
-        TermsOfServiceAccepted: true,
-        Timestamp: new Date().toISOString(),
-        User: updatedUser
-      }
-     
-      Console.log('Economy', `purchase done: user=${user.stumbleId} rewards=${JSON.stringify(rewards)}`);
-      res.json({ User: updatedUser });
+      res.json({
+        success: true,
+        user: updatedUser,
+        rewards: rewards
+      });
     } catch (err) {
       Console.error('Economy', 'Purchase error:', err);
       res.status(500).json({ error: 'INTERNAL_SERVER_ERROR' });
@@ -1706,206 +1291,58 @@ class EconomyController {
     try {
       const { user } = req;
       const { itemId } = req.params;
-      const countParam = parseInt(req.params.count);
-      const drawCount = isNaN(countParam) ? 1 : Math.max(1, countParam);
-      Console.log('Economy', `purchaseGasha start: user=${user.stumbleId} itemId=${itemId} count=${drawCount}`);
-      const hadSkins = new Set((user.skins || []));
+
+      const gashaItem = SharedData.PurchasableItems.find(i => i.Name === itemId && i.Type === 'Gasha');
+      if (!gashaItem) return res.status(404).json({ error: 'GASHA_NOT_FOUND' });
+
+      const price = gashaItem.Prices[0];
+      if (!price || price.Currency !== 'Gems') return res.status(400).json({ error: 'INVALID_PRICE' });
+
+      const userGems = UserModel.getBalanceAmount(user, 'Gems');
+      if (userGems < price.Amount) return res.status(402).json({ error: 'INSUFFICIENT_GEMS' });
+
+      await UserModel.removeBalance(user.stumbleId, 'Gems', price.Amount);
+
       const rewards = [];
-      const allSkins = SharedData.Skins_v4 || [];
+      const possibleDrops = gashaItem.GashaDrops || [];
+      const totalWeight = possibleDrops.reduce((sum, drop) => sum + drop.Weight, 0);
 
-      const gems = UserModel.getBalanceAmount(user, 'gems');
-      const totalCost = 50 * drawCount;
-      if (gems < totalCost) return res.status(402).json({ error: 'NOT_ENOUGH_GEMS' });
+      for (let i = 0; i < (gashaItem.RollCount || 1); i++) {
+        const roll = Math.random() * totalWeight;
+        let weightSum = 0;
 
-      await UserModel.removeBalance(user.deviceId, 'gems', totalCost);
-
-      const gachaDef = (SharedData.Gachas || []).find(g => g.PurchasableItem === itemId || g.Id === itemId);
-      const rotationList = gachaDef?.RotationItemList || [];
-      if (rotationList.length === 0) {
-        Console.warn('Economy', `purchaseGasha missing rotation list for itemId=${itemId}, falling back to Skins_v4`);
-        if (allSkins.length === 0) return res.status(500).json({ error: 'NO_SKINS_AVAILABLE' });
-        // Fallback: use any skin ids
-        for (let i = 0; i < drawCount; i++) {
-          const randomIndex = Math.floor(Math.random() * allSkins.length);
-          const selectedSkin = allSkins[randomIndex];
-          const skinId = selectedSkin.SkinID;
-          let duplicateCurrency = null;
-          let duplicateCurrencyAmount = 0;
-          if (hadSkins.has(skinId)) {
-            duplicateCurrency = 'dust';
-            duplicateCurrencyAmount = 5;
-          } else {
-            await UserModel.addSkin(user.stumbleId, skinId);
-            hadSkins.add(skinId);
+        for (const drop of possibleDrops) {
+          weightSum += drop.Weight;
+          if (roll <= weightSum) {
+            if (drop.Type === 'Currency') {
+              await UserModel.addBalance(user.stumbleId, drop.CurrencyType, drop.Amount);
+              rewards.push({
+                type: 'CURRENCY',
+                currencyType: drop.CurrencyType,
+                amount: drop.Amount,
+                rarity: drop.Rarity
+              });
+            } else if (drop.Type === 'Cosmetic') {
+              await UserModel.addSkin(user.stumbleId, drop.CosmeticId);
+              rewards.push({
+                type: 'COSMETIC',
+                cosmeticType: drop.CosmeticType,
+                cosmeticId: drop.CosmeticId,
+                rarity: drop.Rarity
+              });
+            }
+            break;
           }
-          await database.collections.Users.updateOne(
-            { stumbleId: user.stumbleId },
-            { $push: { Rewards: {
-              Amount: 1,
-              DuplicateCurrency: duplicateCurrency,
-              DuplicateCurrencyAmount: duplicateCurrencyAmount,
-              NestedRewards: [],
-              Type: 'SKIN',
-              TypeInfo: skinId
-            } } }
-          );
-          rewards.push({ type: 'Cosmetic', cosmeticId: skinId });
         }
-      } else {
-        for (let i = 0; i < drawCount; i++) {
-          const randomIndex = Math.floor(Math.random() * rotationList.length);
-          const skinId = rotationList[randomIndex];
-          let duplicateCurrency = null;
-          let duplicateCurrencyAmount = 0;
-          if (hadSkins.has(skinId)) {
-            duplicateCurrency = 'dust';
-            duplicateCurrencyAmount = 5;
-          } else {
-            await UserModel.addSkin(user.stumbleId, skinId);
-            hadSkins.add(skinId);
-          }
-          await database.collections.Users.updateOne(
-            { stumbleId: user.stumbleId },
-            { $push: { Rewards: {
-              Amount: 1,
-              DuplicateCurrency: duplicateCurrency,
-              DuplicateCurrencyAmount: duplicateCurrencyAmount,
-              NestedRewards: [],
-              Type: 'SKIN',
-              TypeInfo: skinId
-            } } }
-          );
-          rewards.push({ type: 'Cosmetic', cosmeticId: skinId });
-        }
-      }
-
-      for (let i = 0; i < drawCount; i++) {
-        const randomIndex = Math.floor(Math.random() * allSkins.length);
-        const selectedSkin = allSkins[randomIndex];
-        const skinId = selectedSkin.SkinID;
-        let duplicateCurrency = null;
-        let duplicateCurrencyAmount = 0;
-        if (hadSkins.has(skinId)) {
-          duplicateCurrency = 'dust';
-          duplicateCurrencyAmount = 5;
-        } else {
-          await UserModel.addSkin(user.stumbleId, skinId);
-          hadSkins.add(skinId);
-        }
-        await database.collections.Users.updateOne(
-          { stumbleId: user.stumbleId },
-          { $push: { Rewards: {
-            Amount: 1,
-            DuplicateCurrency: duplicateCurrency,
-            DuplicateCurrencyAmount: duplicateCurrencyAmount,
-            NestedRewards: [],
-            Type: 'SKIN',
-            TypeInfo: skinId
-          } } }
-        );
-        rewards.push({ type: 'Cosmetic', cosmeticId: skinId });
       }
 
       const updatedUser = await UserModel.findByStumbleId(user.stumbleId);
-      const battlePassEnd = updatedUser.battlePass?.secondsToEnd
-        ? new Date(Date.now() + (updatedUser.battlePass.secondsToEnd * 1000))
-        : new Date();
-
-      const mapBalances = (balances = []) => balances.map(b => ({
-        Amount: b.amount || 0,
-        LastGiven: (b.lastGiven instanceof Date ? b.lastGiven.toISOString() : new Date(b.lastGiven || Date.now()).toISOString()),
-        MaxAmount: b.maxAmount || 0,
-        Name: b.name,
-        SecondsPerUnit: b.secondsPerUnit || 0,
-        SecondsSince: b.secondsSince || 0
-      }));
-
-      const settings = {
-        FriendIsOnlinePush: true,
-        InvitedToPartyPush: true,
-        PartyInviteInGameToastNotification: true,
-        PartyInviteToastNotification: true
-      };
-
-      const userPayload = {
-        Age: updatedUser.age || 0,
-        Animations: updatedUser.animations || [],
-        AvailableNewsVersion: updatedUser.availableNewsVersion || 0,
-        Balances: mapBalances(updatedUser.balances || []),
-        BanReason: '',
-        BattlePass: {
-          FreePassRewards: updatedUser.battlePass?.freePassRewards || [],
-          HasPurchased: !!updatedUser.battlePass?.hasPurchased,
-          PassID: updatedUser.battlePass?.passID || 0,
-          PassTokens: updatedUser.battlePass?.passTokens || 0,
-          PremiumPassRewards: updatedUser.battlePass?.premiumPassRewards || [],
-          SecondsToEnd: updatedUser.battlePass?.secondsToEnd || 0,
-          endTime: battlePassEnd.toISOString()
-        },
-        Country: updatedUser.country || 'BR',
-        Created: updatedUser.creationDate ? updatedUser.creationDate.toISOString() : new Date().toISOString(),
-        Crowns: updatedUser.crowns || 0,
-        DeviceId: updatedUser.deviceId,
-        Emotes: updatedUser.emotes || [],
-        Experience: updatedUser.experience || 0,
-        Footsteps: updatedUser.footsteps || [],
-        FreePassRewards: updatedUser.freePassRewards || [],
-        HasBattlePass: !!updatedUser.hasBattlePass,
-        HiddenRating: updatedUser.hiddenRating || 0,
-        Id: updatedUser.id || 0,
-        Inventory: (updatedUser.inventory || []).map(i => ({ Amount: i.amount || 0, Item: i.item, ItemType: i.itemType })),
-        IsBanned: !!updatedUser.isBanned,
-        KidFriendlyMode: updatedUser.kidFriendlyMode || 0,
-        LastLogin: updatedUser.lastLogin ? updatedUser.lastLogin.toISOString() : new Date().toISOString(),
-        LastLuckySpin: updatedUser.lastLuckySpin ? updatedUser.lastLuckySpin.toISOString() : new Date(Date.now() - 86400000).toISOString(),
-        LatestNewsIdBackend: updatedUser.latestNewsIdBackend || 0,
-        MyOwnCode: updatedUser.MyOwnCode || '',
-        NewsVersion: updatedUser.newsVersion || 0,
-        PassTokens: updatedUser.passTokens || 0,
-        PremiumPassRewards: updatedUser.premiumPassRewards || [],
-        Region: updatedUser.region || 'SA',
-        RewardID: 'deprecated',
-        Rewards: updatedUser.Rewards || [],
-        SecondsSinceCreated: updatedUser.secondsSinceCreated || 0,
-        SelectedSkin: updatedUser.equippedCosmetics?.skin || 'SKIN1',
-        Settings: settings,
-        SkillRating: updatedUser.skillRating || 0,
-        Skins: updatedUser.skins || [],
-        StumbleId: updatedUser.stumbleId,
-        Token: updatedUser.token,
-        Username: updatedUser.username,
-        Version: updatedUser.version || '0'
-      };
-
-      const featureFlagsWorking = [
-        'age-request',
-        'Consensus',
-        'CustomParty',
-        'EndOfMatchRewardedVideo',
-        'GamePlayInGameNotifications',
-        'HelpshiftConversation',
-        'LocalNotifications',
-        'MatchmakingFilter',
-        'NewMatchmaking',
-        'Pusher',
-        'TournamentsX',
-        'TournamentsXMeta',
-        'QuantumSystemManagement',
-        'RemoteLocalizations',
-        'RoomManagementConsole',
-        'TransferAppleIdAuthorization'
-      ];
-
-      const response = {
-        FeatureFlags: featureFlagsWorking,
-        PhotonJwt: "",
-        TermsOfServiceAccepted: true,
-        Timestamp: new Date().toISOString(),
-        User: userPayload
-      };
-
-      Console.log('Economy', `purchaseGasha done: user=${user.stumbleId} rewardsCount=${rewards.length}`);
-      return res.status(200).json({ User: userPayload });
+      res.json({
+        success: true,
+        user: updatedUser,
+        rewards: rewards,
+        gashaId: gashaItem.Name
+      });
     } catch (err) {
       Console.error('Economy', 'Gasha error:', err);
       res.status(500).json({ error: 'INTERNAL_SERVER_ERROR' });
@@ -1915,506 +1352,50 @@ class EconomyController {
   static async purchaseLuckySpin(req, res) {
     try {
       const { user } = req;
-      Console.log('Economy', `purchaseLuckySpin start: user=${user.stumbleId}`);
+      const spinItem = SharedData.PurchasableItems.find(i => i.Type === 'LuckySpin');
+      if (!spinItem) return res.status(404).json({ error: 'SPIN_NOT_CONFIGURED' });
 
-      const gems = UserModel.getBalanceAmount(user, 'gems');
-      if (gems < 50) return res.status(402).json({ error: 'NOT_ENOUGH_GEMS' });
+      const freeSpins = UserModel.getBalanceAmount(user, 'FreeSpins');
+      const adSpins = UserModel.getBalanceAmount(user, 'AdSpins');
 
-      await UserModel.removeBalance(user.deviceId, 'gems', 50);
-
-      const allSkins = SharedData.Skins_v4 || [];
-      if (allSkins.length === 0) return res.status(500).json({ error: 'NO_SKINS_AVAILABLE' });
-
-      const randomIndex = Math.floor(Math.random() * allSkins.length);
-      const selectedSkin = allSkins[randomIndex];
-
-      const skinId = selectedSkin.SkinID;
-      let duplicateCurrency = null;
-      let duplicateCurrencyAmount = 0;
-      const hadSkins = new Set((user.skins || []).map(s => s));
-      if (hadSkins.has(skinId)) {
-        duplicateCurrency = 'dust';
-        duplicateCurrencyAmount = 5;
-      } else {
-        await UserModel.addSkin(user.stumbleId, skinId);
+      if (freeSpins <= 0 && adSpins <= 0) {
+        return res.status(402).json({ error: 'NO_SPINS_AVAILABLE' });
       }
 
-      await database.collections.Users.updateOne(
-        { stumbleId: user.stumbleId },
-        { $push: { Rewards: {
-          Amount: 1,
-          DuplicateCurrency: duplicateCurrency,
-          DuplicateCurrencyAmount: duplicateCurrencyAmount,
-          NestedRewards: [],
-          Type: 'SKIN',
-          TypeInfo: skinId
-        } } }
-      );
+      const spinType = freeSpins > 0 ? 'FreeSpins' : 'AdSpins';
+      await UserModel.removeBalance(user.stumbleId, spinType, 1);
 
-      const updatedUser = await UserModel.findByStumbleId(user.stumbleId);
+      const possibleRewards = spinItem.SpinRewards || [];
+      const totalWeight = possibleRewards.reduce((sum, r) => sum + r.Weight, 0);
+      const roll = Math.random() * totalWeight;
+      let weightSum = 0;
+      let selectedReward = null;
 
-      const battlePassEnd = updatedUser.battlePass?.secondsToEnd
-        ? new Date(Date.now() + (updatedUser.battlePass.secondsToEnd * 1000))
-        : new Date();
-
-      const mapBalances = (balances = []) => balances.map(b => ({
-        Amount: b.amount || 0,
-        LastGiven: (b.lastGiven instanceof Date ? b.lastGiven.toISOString() : new Date(b.lastGiven || Date.now()).toISOString()),
-        MaxAmount: b.maxAmount || 0,
-        Name: b.name,
-        SecondsPerUnit: b.secondsPerUnit || 0,
-        SecondsSince: b.secondsSince || 0
-      }));
-
-      const settings = {
-        FriendIsOnlinePush: true,
-        InvitedToPartyPush: true,
-        PartyInviteInGameToastNotification: true,
-        PartyInviteToastNotification: true
-      };
-
-      const userPayload = {
-        Age: updatedUser.age || 0,
-        Animations: updatedUser.animations || [],
-        AvailableNewsVersion: updatedUser.availableNewsVersion || 0,
-        Balances: mapBalances(updatedUser.balances || []),
-        BanReason: '',
-        BattlePass: {
-          FreePassRewards: updatedUser.battlePass?.freePassRewards || [],
-          HasPurchased: !!updatedUser.battlePass?.hasPurchased,
-          PassID: updatedUser.battlePass?.passID || 0,
-          PassTokens: updatedUser.battlePass?.passTokens || 0,
-          PremiumPassRewards: updatedUser.battlePass?.premiumPassRewards || [],
-          SecondsToEnd: updatedUser.battlePass?.secondsToEnd || 0,
-          endTime: battlePassEnd.toISOString()
-        },
-        Country: updatedUser.country || 'BR',
-        Created: updatedUser.creationDate ? updatedUser.creationDate.toISOString() : new Date().toISOString(),
-        Crowns: updatedUser.crowns || 0,
-        DeviceId: updatedUser.deviceId,
-        Emotes: updatedUser.emotes || [],
-        Experience: updatedUser.experience || 0,
-        Footsteps: updatedUser.footsteps || [],
-        FreePassRewards: updatedUser.freePassRewards || [],
-        HasBattlePass: !!updatedUser.hasBattlePass,
-        HiddenRating: updatedUser.hiddenRating || 0,
-        Id: updatedUser.id || 0,
-        Inventory: (updatedUser.inventory || []).map(i => ({ Amount: i.amount || 0, Item: i.item, ItemType: i.itemType })),
-        IsBanned: !!updatedUser.isBanned,
-        KidFriendlyMode: updatedUser.kidFriendlyMode || 0,
-        LastLogin: updatedUser.lastLogin ? updatedUser.lastLogin.toISOString() : new Date().toISOString(),
-        LastLuckySpin: updatedUser.lastLuckySpin ? updatedUser.lastLuckySpin.toISOString() : new Date().toISOString(),
-        LatestNewsIdBackend: updatedUser.latestNewsIdBackend || 0,
-        MyOwnCode: updatedUser.MyOwnCode || '',
-        NewsVersion: updatedUser.newsVersion || 0,
-        PassTokens: updatedUser.passTokens || 0,
-        PremiumPassRewards: updatedUser.premiumPassRewards || [],
-        Region: updatedUser.region || 'SA',
-        RewardID: 'deprecated',
-        Rewards: updatedUser.Rewards || [],
-        SecondsSinceCreated: updatedUser.secondsSinceCreated || 0,
-        SelectedSkin: updatedUser.equippedCosmetics?.skin || 'SKIN1',
-        Settings: settings,
-        SkillRating: updatedUser.skillRating || 0,
-        Skins: updatedUser.skins || [],
-        StumbleId: updatedUser.stumbleId,
-        Token: updatedUser.token,
-        Username: updatedUser.username,
-        Version: updatedUser.version || '0'
-      };
-
-      const response = {
-        FeatureFlags: updatedUser.featureFlags || [],
-        PhotonJwt: "",
-        TermsOfServiceAccepted: true,
-        Timestamp: new Date().toISOString(),
-        User: userPayload
-      };
-
-      Console.log('Economy', `purchaseLuckySpin done: user=${user.stumbleId} skin=${skinId}`);
-      return res.status(200).json({ User: userPayload });
-    } catch (err) {
-      Console.error('Economy', 'LuckySpin error:', err);
-      res.status(500).json({ error: 'INTERNAL_SERVER_ERROR' });
-    }
-  }
-
-  static async purchaseLuckySpinWheel(req, res) {
-    try {
-      const { user } = req;
-      Console.log('Economy', `purchaseLuckySpinWheel start: user=${user.stumbleId}`);
-
-      const now = new Date();
-      await UserModel.addBalance(user.deviceId, 'gems', 10);
-      await database.collections.Users.updateOne(
-        { stumbleId: user.stumbleId },
-        { $set: { lastLuckySpin: now } }
-      );
-
-      await database.collections.Users.updateOne(
-        { stumbleId: user.stumbleId, "balances.name": "gems" },
-        { $set: { "balances.$.lastGiven": now } }
-      );
-
-      await database.collections.Users.updateOne(
-        { stumbleId: user.stumbleId },
-        { $push: { Rewards: {
-          Amount: 10,
-          DuplicateCurrency: null,
-          DuplicateCurrencyAmount: 0,
-          NestedRewards: [],
-          Type: 'CURRENCY',
-          TypeInfo: 'gems'
-        } } }
-      );
-
-      const updatedUser = await UserModel.findByStumbleId(user.stumbleId);
-
-      const mapBalances = (balances = []) => balances.map(b => ({
-        Amount: b.amount || 0,
-        LastGiven: (b.lastGiven instanceof Date ? b.lastGiven.toISOString() : new Date(b.lastGiven || Date.now()).toISOString()),
-        MaxAmount: b.maxAmount || 0,
-        Name: b.name,
-        SecondsPerUnit: b.secondsPerUnit || 0,
-        SecondsSince: b.secondsSince || 0
-      }));
-
-      const settings = {
-        FriendIsOnlinePush: true,
-        InvitedToPartyPush: true,
-        PartyInviteInGameToastNotification: true,
-        PartyInviteToastNotification: true
-      };
-
-      const battlePassEnd = updatedUser.battlePass?.secondsToEnd
-        ? new Date(Date.now() + (updatedUser.battlePass.secondsToEnd * 1000))
-        : new Date();
-
-      const userPayload = {
-        Age: updatedUser.age || 0,
-        Animations: updatedUser.animations || [],
-        AvailableNewsVersion: updatedUser.availableNewsVersion || 0,
-        Balances: mapBalances(updatedUser.balances || []),
-        BanReason: '',
-        BattlePass: {
-          FreePassRewards: updatedUser.battlePass?.freePassRewards || [],
-          HasPurchased: !!updatedUser.battlePass?.hasPurchased,
-          PassID: updatedUser.battlePass?.passID || 0,
-          PassTokens: updatedUser.battlePass?.passTokens || 0,
-          PremiumPassRewards: updatedUser.battlePass?.premiumPassRewards || [],
-          SecondsToEnd: updatedUser.battlePass?.secondsToEnd || 0,
-          endTime: battlePassEnd.toISOString()
-        },
-        Country: updatedUser.country || 'BR',
-        Created: updatedUser.creationDate ? updatedUser.creationDate.toISOString() : new Date().toISOString(),
-        Crowns: updatedUser.crowns || 0,
-        DeviceId: updatedUser.deviceId,
-        Emotes: updatedUser.emotes || [],
-        Experience: updatedUser.experience || 0,
-        Footsteps: updatedUser.footsteps || [],
-        FreePassRewards: updatedUser.freePassRewards || [],
-        HasBattlePass: !!updatedUser.hasBattlePass,
-        HiddenRating: updatedUser.hiddenRating || 0,
-        Id: updatedUser.id || 0,
-        Inventory: (updatedUser.inventory || []).map(i => ({ Amount: i.amount || 0, Item: i.item, ItemType: i.itemType })),
-        IsBanned: !!updatedUser.isBanned,
-        KidFriendlyMode: updatedUser.kidFriendlyMode || 0,
-        LastLogin: updatedUser.lastLogin ? updatedUser.lastLogin.toISOString() : new Date().toISOString(),
-        LastLuckySpin: updatedUser.lastLuckySpin ? updatedUser.lastLuckySpin.toISOString() : now.toISOString(),
-        LatestNewsIdBackend: updatedUser.latestNewsIdBackend || 0,
-        MyOwnCode: updatedUser.MyOwnCode || '',
-        NewsVersion: updatedUser.newsVersion || 0,
-        PassTokens: updatedUser.passTokens || 0,
-        PremiumPassRewards: updatedUser.premiumPassRewards || [],
-        Region: updatedUser.region || 'SA',
-        RewardID: 'deprecated',
-        Rewards: [{
-          amount: 10,
-          duplicateCurrencyAmount: 0,
-          nestedRewards: [],
-          sourceType: 'UNKNOWN',
-          type: 'CURRENCY',
-          typeInfo: 'gems'
-        }],
-        SecondsSinceCreated: updatedUser.secondsSinceCreated || 0,
-        SelectedSkin: updatedUser.equippedCosmetics?.skin || 'SKIN1',
-        Settings: settings,
-        SkillRating: updatedUser.skillRating || 0,
-        Skins: updatedUser.skins || [],
-        StumbleId: updatedUser.stumbleId,
-        Token: updatedUser.token,
-        Username: updatedUser.username,
-        Version: updatedUser.version || '0'
-      };
-
-      
-      Console.log('Economy', `purchaseLuckySpinWheel done: user=${user.stumbleId}`);
-      return res.status(200).json({ User: userPayload });
-    } catch (err) {
-      Console.error('Economy', 'LuckySpinWheel error:', err);
-      res.status(500).json({ error: 'INTERNAL_SERVER_ERROR' });
-    }
-  }
-
-  static async purchaseDrop(req, res) {
-    try {
-      const { user } = req;
-      const { itemId, count } = req.params;
-      Console.log('Economy', `purchaseDrop start: user=${user.stumbleId} rarity=${itemId} count=${count}`);
-
-      const photonJwt = "";
-
-      const rarity = String(itemId || '').toUpperCase();
-      const totalCount = Math.max(1, parseInt(count || '1', 10) || 1);
-
-      const allSkins = Array.isArray(SharedData.Skins_v4) ? SharedData.Skins_v4 : [];
-      const byRarity = allSkins.filter(s => String(s.Rarity).toUpperCase() === rarity);
-
-      function findMobileLuckySpinOffer(shared) {
-        if (Array.isArray(shared.LuckySpinWheels)) {
-          for (const wheel of shared.LuckySpinWheels) {
-            const platforms = Array.isArray(wheel.Platforms) ? wheel.Platforms : [];
-            if (Array.isArray(wheel.SpinVisualDropsList) && (platforms.includes('android') || platforms.includes('ios'))) {
-              return wheel;
-            }
-          }
-        }
-        for (const key of Object.keys(shared)) {
-          const val = shared[key];
-          if (Array.isArray(val)) {
-            for (const el of val) {
-              if (el && typeof el === 'object') {
-                const platforms = Array.isArray(el.Platforms) ? el.Platforms : [];
-                if (Array.isArray(el.SpinVisualDropsList) && (platforms.includes('android') || platforms.includes('ios'))) {
-                  return el;
-                }
-              }
-            }
-          } else if (val && typeof val === 'object') {
-            const platforms = Array.isArray(val.Platforms) ? val.Platforms : [];
-            if (Array.isArray(val.SpinVisualDropsList) && (platforms.includes('android') || platforms.includes('ios'))) {
-              return val;
-            }
-          }
-        }
-        return null;
-      }
-
-      const spinOffer = findMobileLuckySpinOffer(SharedData);
-      const visualSkinIdsRaw = spinOffer
-        ? (spinOffer.SpinVisualDropsList || []).filter(x => typeof x === 'string' && x.startsWith('SKIN'))
-        : [];
-      const skinById = new Map(allSkins.map(s => [s.SkinID, s]));
-      let visualSkinIds = visualSkinIdsRaw.filter(id => (skinById.get(id)?.Rarity || '').toUpperCase() === rarity);
-      if (visualSkinIds.length === 0) {
-        visualSkinIds = visualSkinIdsRaw; // fallback: allow any SKIN in visual list
-      }
-      Console.log('Economy', `purchaseDrop spinOffer=${spinOffer?.Id || 'unknown'} rarity=${rarity} visualCount=${visualSkinIds.length}`);
-
-      const existingSkins = new Set((user.skins || []).map(s => s));
-
-      const picks = [];
-      let pool = [];
-      if (visualSkinIds.length > 0) {
-        pool = visualSkinIds.filter(id => !existingSkins.has(id));
-      } else {
-        pool = [...byRarity.map(s => s.SkinID).filter(id => !existingSkins.has(id))];
-      }
-
-      function pickUniqueFromPool(n) {
-        const chosen = [];
-        const tempPool = [...pool];
-        for (let i = 0; i < n && tempPool.length > 0; i++) {
-          const idx = Math.floor(Math.random() * tempPool.length);
-          const id = tempPool.splice(idx, 1)[0];
-          chosen.push(id);
-        }
-        return chosen;
-      }
-
-      // Fill with unique picks first
-      picks.push(...pickUniqueFromPool(totalCount));
-      let remaining = totalCount - picks.length;
-      // If need more, fill with random from visual list (with replacement) or byRarity
-      while (remaining > 0) {
-        if (visualSkinIds.length > 0) {
-          const idx = Math.floor(Math.random() * visualSkinIds.length);
-          picks.push(visualSkinIds[idx]);
-        } else if (byRarity.length > 0) {
-          const idx = Math.floor(Math.random() * byRarity.length);
-          picks.push(byRarity[idx].SkinID);
-        } else {
+      for (const reward of possibleRewards) {
+        weightSum += reward.Weight;
+        if (roll <= weightSum) {
+          selectedReward = reward;
           break;
         }
-        remaining--;
       }
 
-      if (picks.length === 0) {
-        if (visualSkinIds.length > 0) {
-          for (let i = 0; i < totalCount; i++) {
-            const idx = Math.floor(Math.random() * visualSkinIds.length);
-            picks.push(visualSkinIds[idx]);
-          }
-        } else if (byRarity.length > 0) {
-          for (let i = 0; i < totalCount; i++) {
-            const idx = Math.floor(Math.random() * byRarity.length);
-            picks.push(byRarity[idx].SkinID);
-          }
+      if (selectedReward) {
+        if (selectedReward.Type === 'Currency') {
+          await UserModel.addBalance(user.stumbleId, selectedReward.CurrencyType, selectedReward.Amount);
+        } else if (selectedReward.Type === 'Cosmetic') {
+          await UserModel.addSkin(user.stumbleId, selectedReward.CosmeticId);
         }
-      }
-
-      const hadSkins = new Set((user.skins || []).map(s => s));
-      for (const skinId of picks) {
-        let duplicateCurrency = null;
-        let duplicateCurrencyAmount = 0;
-        if (hadSkins.has(skinId)) {
-          duplicateCurrency = 'dust';
-          duplicateCurrencyAmount = 5;
-        } else {
-          await UserModel.addSkin(user.stumbleId, skinId);
-          hadSkins.add(skinId);
-        }
-        const noVisual = !(spinOffer && visualSkinIds.length > 0);
-        const typeInfoForSpin = noVisual ? rarity.toUpperCase() : skinId;
-        const rewardDoc = noVisual ? {
-          Amount: 1,
-          DuplicateCurrency: null,
-          DuplicateCurrencyAmount: 0,
-          NestedRewards: [{
-            Amount: 1,
-            DuplicateCurrency: duplicateCurrency,
-            DuplicateCurrencyAmount: duplicateCurrencyAmount,
-            NestedRewards: [],
-            Type: 'SKIN',
-            TypeInfo: skinId
-          }],
-          Type: 'LOOTBOX',
-          TypeInfo: typeInfoForSpin
-        } : {
-          Amount: 1,
-          DuplicateCurrency: duplicateCurrency,
-          DuplicateCurrencyAmount: duplicateCurrencyAmount,
-          NestedRewards: [],
-          Type: 'SKIN',
-          TypeInfo: typeInfoForSpin
-        };
-        await database.collections.Users.updateOne(
-          { stumbleId: user.stumbleId },
-          { $push: { Rewards: rewardDoc } }
-        );
-        Console.log('Economy', `purchaseDrop reward pushed type=${noVisual ? 'LOOTBOX' : 'SKIN'} typeInfo=${typeInfoForSpin} nested=${noVisual ? skinId : 'none'}`);
       }
 
       const updatedUser = await UserModel.findByStumbleId(user.stumbleId);
-
-      const battlePassEnd = updatedUser.battlePass?.secondsToEnd
-        ? new Date(Date.now() + (updatedUser.battlePass.secondsToEnd * 1000))
-        : new Date();
-
-      const mapBalances = (balances = []) => balances.map(b => ({
-        Amount: b.amount || 0,
-        LastGiven: (b.lastGiven instanceof Date ? b.lastGiven.toISOString() : new Date(b.lastGiven || Date.now()).toISOString()),
-        MaxAmount: b.maxAmount || 0,
-        Name: b.name,
-        SecondsPerUnit: b.secondsPerUnit || 0,
-        SecondsSince: b.secondsSince || 0
-      }));
-
-      const settings = {
-        FriendIsOnlinePush: true,
-        InvitedToPartyPush: true,
-        PartyInviteInGameToastNotification: true,
-        PartyInviteToastNotification: true
-      };
-
-      const userPayload = {
-        Age: updatedUser.age || 0,
-        Animations: updatedUser.animations || [],
-        AvailableNewsVersion: updatedUser.availableNewsVersion || 0,
-        Balances: mapBalances(updatedUser.balances || []),
-        BanReason: '',
-        BattlePass: {
-          FreePassRewards: updatedUser.battlePass?.freePassRewards || [],
-          HasPurchased: !!updatedUser.battlePass?.hasPurchased,
-          PassID: updatedUser.battlePass?.passID || 0,
-          PassTokens: updatedUser.battlePass?.passTokens || 0,
-          PremiumPassRewards: updatedUser.battlePass?.premiumPassRewards || [],
-          SecondsToEnd: updatedUser.battlePass?.secondsToEnd || 0,
-          endTime: battlePassEnd.toISOString()
-        },
-        Country: updatedUser.country || 'BR',
-        Created: updatedUser.creationDate ? updatedUser.creationDate.toISOString() : new Date().toISOString(),
-        Crowns: updatedUser.crowns || 0,
-        DeviceId: updatedUser.deviceId,
-        Emotes: updatedUser.emotes || [],
-        Experience: updatedUser.experience || 0,
-        Footsteps: updatedUser.footsteps || [],
-        FreePassRewards: updatedUser.freePassRewards || [],
-        HasBattlePass: !!updatedUser.hasBattlePass,
-        HiddenRating: updatedUser.hiddenRating || 0,
-        Id: updatedUser.id || 0,
-        Inventory: (updatedUser.inventory || []).map(i => ({ Amount: i.amount || 0, Item: i.item, ItemType: i.itemType })),
-        IsBanned: !!updatedUser.isBanned,
-        KidFriendlyMode: updatedUser.kidFriendlyMode || 0,
-        LastLogin: updatedUser.lastLogin ? updatedUser.lastLogin.toISOString() : new Date().toISOString(),
-        LastLuckySpin: updatedUser.lastLuckySpin ? updatedUser.lastLuckySpin.toISOString() : new Date(Date.now() - 86400000).toISOString(),
-        LatestNewsIdBackend: updatedUser.latestNewsIdBackend || 0,
-        MyOwnCode: updatedUser.MyOwnCode || '',
-        NewsVersion: updatedUser.newsVersion || 0,
-        PassTokens: updatedUser.passTokens || 0,
-        PremiumPassRewards: updatedUser.premiumPassRewards || [],
-        Region: updatedUser.region || 'SA',
-        RewardID: 'deprecated',
-        Rewards: updatedUser.Rewards || [],
-        SecondsSinceCreated: updatedUser.secondsSinceCreated || 0,
-        SelectedSkin: updatedUser.equippedCosmetics?.skin || 'SKIN1',
-        Settings: settings,
-        SkillRating: updatedUser.skillRating || 0,
-        Skins: updatedUser.skins || [],
-        StumbleId: updatedUser.stumbleId,
-        Token: updatedUser.token,
-        Username: updatedUser.username,
-        Version: updatedUser.version || '0'
-      };
-
-      const featureFlagsWorking = [
-        'age-request',
-        'Consensus',
-        'CustomParty',
-        'EndOfMatchRewardedVideo',
-        'GamePlayInGameNotifications',
-        'HelpshiftConversation',
-        'LocalNotifications',
-        'MatchmakingFilter',
-        'NewMatchmaking',
-        'Pusher',
-        'TournamentsX',
-        'TournamentsXMeta',
-        'QuantumSystemManagement',
-        'RemoteLocalizations',
-        'RoomManagementConsole',
-        'TransferAppleIdAuthorization'
-      ];
-
-      const response = {
-        FeatureFlags: featureFlagsWorking,
-        PhotonJwt: photonJwt,
-        TermsOfServiceAccepted: true,
-        Timestamp: new Date().toISOString(),
-        User: userPayload
-      };
-
-      Console.log('Economy', `purchaseDrop done: user=${user.stumbleId} picks=${picks.length}`);
-      const wantsCompression = String(req.headers['use_response_compression'] || '').toLowerCase() === 'true' && String(req.headers['accept-encoding'] || '').includes('gzip');
-      if (wantsCompression) {
-        const buf = zlib.gzipSync(Buffer.from(JSON.stringify(response)));
-        res.set('Content-Encoding', 'gzip');
-        res.set('Content-Type', 'application/json');
-        return res.status(200).send(buf);
-      }
-      return res.status(200).json({ User: userPayload });
+      res.json({
+        success: true,
+        user: updatedUser,
+        reward: selectedReward,
+        spinType: spinType
+      });
     } catch (err) {
-      Console.error('Economy', 'PurchaseDrop error:', err);
+      Console.error('Economy', 'Spin error:', err);
       res.status(500).json({ error: 'INTERNAL_SERVER_ERROR' });
     }
   }
@@ -2423,20 +1404,9 @@ class EconomyController {
     try {
       const { currencyType, amount } = req.params;
       const { user } = req;
-      Console.log('Economy', `giveCurrency start: user=${user.stumbleId} type=${currencyType} amount=${amount}`);
 
-      const currencyMap = {
-        Gems: 'gems',
-        Gold: 'coins',
-        Dust: 'dust',
-        FreeSpins: 'default_free_spins',
-        AdSpins: 'default_free_ad_spins'
-      };
-
-      const resolvedCurrency = currencyMap[currencyType] || currencyType;
-      const userBalanceNames = (user.balances || []).map(b => b.name);
-      const isKnownCurrency = userBalanceNames.includes(resolvedCurrency);
-      if (!isKnownCurrency) {
+      const validCurrencies = ['Gems', 'Gold', 'Dust', 'FreeSpins', 'AdSpins'];
+      if (!validCurrencies.includes(currencyType)) {
         return res.status(400).json({ error: 'INVALID_CURRENCY' });
       }
 
@@ -2445,14 +1415,16 @@ class EconomyController {
         return res.status(400).json({ error: 'INVALID_AMOUNT' });
       }
 
-      await UserModel.addBalance(user.deviceId, resolvedCurrency, parsedAmount);
+      await UserModel.addBalance(user.stumbleId, currencyType, parsedAmount);
       const updatedUser = await UserModel.findByStumbleId(user.stumbleId);
 
-      Console.log('Economy', `giveCurrency done: user=${user.stumbleId} type=${resolvedCurrency} amount=${parsedAmount}`);
       res.json({
         success: true,
         user: updatedUser,
-        currencyAdded: { type: resolvedCurrency, amount: parsedAmount }
+        currencyAdded: {
+          type: currencyType,
+          amount: parsedAmount
+        }
       });
     } catch (err) {
       Console.error('Economy', 'GiveCurrency error:', err);
@@ -2460,8 +1432,6 @@ class EconomyController {
     }
   }
 }
-
-
 class AnalyticsController {
   static async analytic(req, res) {
     try {
@@ -2478,7 +1448,7 @@ class AnalyticsController {
         message,
         timestamp: new Date()
       });
-      Console.log("Analytics", `Received analytic from user ${user.username}: [${type}] ${message}`);
+
       res.status(200).json("OK");
     } catch (err) {
       Console.error("Analytics", "Error:", err);
@@ -2493,13 +1463,17 @@ class FriendsController {
       const { UserId } = req.body;
       const { user } = req;
 
-      if (!UserId) return res.status(400).json({ message: 'UserId is required' });
+      if (!UserId) {
+        return res.status(400).json({ ResultCode: -1, Message: 'UserId is required' });
+      }
 
       const friend = await UserModel.findById(UserId);
-      if (!friend) return res.status(404).json({ message: 'User not found' });
+      if (!friend) {
+        return res.status(404).json({ ResultCode: -1, Message: 'User not found' });
+      }
 
       if (user.friends.includes(friend.stumbleId)) {
-        return res.status(409).json({ message: 'Already friends' });
+        return res.status(409).json({ ResultCode: -1, Message: 'Already friends' });
       }
 
       await database.collections.Users.updateOne(
@@ -2513,10 +1487,15 @@ class FriendsController {
       );
 
       const updatedUser = await UserModel.findByStumbleId(user.stumbleId);
-      return res.status(200).json(updatedUser.userProfile);
+
+      return res.status(200).json({
+        ResultCode: 1,
+        User: updatedUser.userProfile
+      });
+
     } catch (err) {
-      console.error('Friends Add error:', err);
-      return res.status(500).json({ message: 'Internal server error' });
+      Console.error('Friends', 'Add error:', err);
+      return res.status(500).json({ ResultCode: -1, Message: 'Internal server error' });
     }
   }
 
@@ -2525,13 +1504,17 @@ class FriendsController {
       const { UserId } = req.body;
       const { user } = req;
 
-      if (!UserId) return res.status(400).json({ message: 'UserId is required' });
+      if (!UserId) {
+        return res.status(400).json({ ResultCode: -1, Message: 'UserId is required' });
+      }
 
       const toUser = await UserModel.findById(UserId);
-      if (!toUser) return res.status(404).json({ message: 'User not found' });
+      if (!toUser) {
+        return res.status(404).json({ ResultCode: -1, Message: 'User not found' });
+      }
 
       if (user.sentFriendRequests.includes(toUser.stumbleId)) {
-        return res.status(409).json({ message: 'Request already sent' });
+        return res.status(409).json({ ResultCode: -1, Message: 'Request already sent' });
       }
 
       await database.collections.Users.updateOne(
@@ -2545,10 +1528,15 @@ class FriendsController {
       );
 
       const updatedUser = await UserModel.findByStumbleId(user.stumbleId);
-      return res.status(200).json(updatedUser.userProfile);
+
+      return res.status(200).json({
+        ResultCode: 1,
+        User: updatedUser.userProfile
+      });
+
     } catch (err) {
-      console.error('Friends Request error:', err);
-      return res.status(500).json({ message: 'Internal server error' });
+      Console.error('Friends', 'Request error:', err);
+      return res.status(500).json({ ResultCode: -1, Message: 'Internal server error' });
     }
   }
 
@@ -2557,13 +1545,17 @@ class FriendsController {
       const { UserId } = req.body;
       const { user } = req;
 
-      if (!UserId) return res.status(400).json({ message: 'UserId is required' });
+      if (!UserId) {
+        return res.status(400).json({ ResultCode: -1, Message: 'UserId is required' });
+      }
 
       const fromUser = await UserModel.findById(UserId);
-      if (!fromUser) return res.status(404).json({ message: 'User not found' });
+      if (!fromUser) {
+        return res.status(404).json({ ResultCode: -1, Message: 'User not found' });
+      }
 
       if (!user.receivedFriendRequests.includes(fromUser.stumbleId)) {
-        return res.status(404).json({ message: 'No friend request found' });
+        return res.status(404).json({ ResultCode: -1, Message: 'No friend request found' });
       }
 
       await database.collections.Users.updateOne(
@@ -2583,10 +1575,15 @@ class FriendsController {
       );
 
       const updatedUser = await UserModel.findByStumbleId(user.stumbleId);
-      return res.status(200).json(updatedUser.userProfile);
+
+      return res.status(200).json({
+        ResultCode: 1,
+        User: updatedUser.userProfile
+      });
+
     } catch (err) {
-      console.error('Friends Accept error:', err);
-      return res.status(500).json({ message: 'Internal server error' });
+      Console.error('Friends', 'Accept error:', err);
+      return res.status(500).json({ ResultCode: -1, Message: 'Internal server error' });
     }
   }
 
@@ -2595,13 +1592,17 @@ class FriendsController {
       const { UserId } = req.body;
       const { user } = req;
 
-      if (!UserId) return res.status(400).json({ message: 'UserId is required' });
+      if (!UserId) {
+        return res.status(400).json({ ResultCode: -1, Message: 'UserId is required' });
+      }
 
       const fromUser = await UserModel.findById(UserId);
-      if (!fromUser) return res.status(404).json({ message: 'User not found' });
+      if (!fromUser) {
+        return res.status(404).json({ ResultCode: -1, Message: 'User not found' });
+      }
 
       if (!user.receivedFriendRequests.includes(fromUser.stumbleId)) {
-        return res.status(404).json({ message: 'No friend request found' });
+        return res.status(404).json({ ResultCode: -1, Message: 'No friend request found' });
       }
 
       await database.collections.Users.updateOne(
@@ -2615,10 +1616,15 @@ class FriendsController {
       );
 
       const updatedUser = await UserModel.findByStumbleId(user.stumbleId);
-      return res.status(200).json(updatedUser.userProfile);
+
+      return res.status(200).json({
+        ResultCode: 1,
+        User: updatedUser.userProfile
+      });
+
     } catch (err) {
-      console.error('Friends Reject error:', err);
-      return res.status(500).json({ message: 'Internal server error' });
+      Console.error('Friends', 'Reject error:', err);
+      return res.status(500).json({ ResultCode: -1, Message: 'Internal server error' });
     }
   }
 
@@ -2627,13 +1633,17 @@ class FriendsController {
       const { UserId } = req.body;
       const { user } = req;
 
-      if (!UserId) return res.status(400).json({ message: 'UserId is required' });
+      if (!UserId) {
+        return res.status(400).json({ ResultCode: -1, Message: 'UserId is required' });
+      }
 
       const toUser = await UserModel.findById(UserId);
-      if (!toUser) return res.status(404).json({ message: 'User not found' });
+      if (!toUser) {
+        return res.status(404).json({ ResultCode: -1, Message: 'User not found' });
+      }
 
       if (!user.sentFriendRequests.includes(toUser.stumbleId)) {
-        return res.status(404).json({ message: 'No friend request found' });
+        return res.status(404).json({ ResultCode: -1, Message: 'No friend request found' });
       }
 
       await database.collections.Users.updateOne(
@@ -2647,40 +1657,32 @@ class FriendsController {
       );
 
       const updatedUser = await UserModel.findByStumbleId(user.stumbleId);
-      return res.status(200).json(updatedUser.userProfile);
+
+      return res.status(200).json({
+        ResultCode: 1,
+        User: updatedUser.userProfile
+      });
+
     } catch (err) {
-      console.error('Friends Cancel error:', err);
-      return res.status(500).json({ message: 'Internal server error' });
+      Console.error('Friends', 'Cancel error:', err);
+      return res.status(500).json({ ResultCode: -1, Message: 'Internal server error' });
     }
   }
 
-static async list(req, res) {
+  static async list(req, res) {
     try {
       const { user } = req;
-      const ONLINE_THRESHOLD = 15 * 60 * 1000; // 15 minutos
-      const now = new Date();
 
       const friends = await database.collections.Users.find({
         stumbleId: { $in: user.friends || [] }
       }).project({
-        userProfile: 1,
-        lastLogin: 1
+        userProfile: 1
       }).toArray();
 
-      const friendsWithOnlineStatus = friends.map(f => {
-        const lastLogin = f.lastLogin ? new Date(f.lastLogin) : null;
-        const isOnline = lastLogin && (now - lastLogin) < ONLINE_THRESHOLD;
-        
-        return {
-          ...f.userProfile,
-          isOnline: isOnline
-        };
-      });
-
-      return res.status(200).json({friends: friendsWithOnlineStatus});
+      return res.status(200).json(friends.map(f => f.userProfile));
     } catch (err) {
-      console.error('Friends List error:', err);
-      return res.status(500).json({ message: 'Internal server error' });
+      Console.error('Friends', 'List error:', err);
+      return res.status(500).json({ ResultCode: -1, Message: 'Internal server error' });
     }
   }
 
@@ -2696,8 +1698,8 @@ static async list(req, res) {
 
       return res.status(200).json(pendingUsers.map(u => u.userProfile));
     } catch (err) {
-      Console.error('Friends', 'Friends Pending error:', err);
-      return res.status(500).json({ message: 'Internal server error' });
+      Console.error('Friends', 'Pending error:', err);
+      return res.status(500).json({ ResultCode: -1, Message: 'Internal server error' });
     }
   }
 
@@ -2706,13 +1708,17 @@ static async list(req, res) {
       const { UserId } = req.params;
       const { user } = req;
 
-      if (!UserId) return res.status(400).json({ message: 'UserId is required' });
+      if (!UserId) {
+        return res.status(400).json({ ResultCode: -1, Message: 'UserId is required' });
+      }
 
       const friend = await UserModel.findById(UserId);
-      if (!friend) return res.status(404).json({ message: 'User not found' });
+      if (!friend) {
+        return res.status(404).json({ ResultCode: -1, Message: 'User not found' });
+      }
 
       if (!user.friends.includes(friend.stumbleId)) {
-        return res.status(404).json({ message: 'Not friends' });
+        return res.status(404).json({ ResultCode: -1, Message: 'Not friends' });
       }
 
       await database.collections.Users.updateOne(
@@ -2726,10 +1732,15 @@ static async list(req, res) {
       );
 
       const updatedUser = await UserModel.findByStumbleId(user.stumbleId);
-      return res.status(200).json(updatedUser.userProfile);
+
+      return res.status(200).json({
+        ResultCode: 1,
+        User: updatedUser.userProfile
+      });
+
     } catch (err) {
-      Console.error('Friends', 'Friends Remove error:', err);
-      return res.status(500).json({ message: 'Internal server error' });
+      Console.error('Friends', 'Remove error:', err);
+      return res.status(500).json({ ResultCode: -1, Message: 'Internal server error' });
     }
   }
 
@@ -2738,31 +1749,31 @@ static async list(req, res) {
       const { UserName } = req.body;
 
       if (!UserName || UserName.length < 3) {
-        Console.log("Friends", `Invalid UserName: ${UserName}`);
-        return res.status(400).json({ message: 'UserName must be at least 3 characters' });
+        return res.status(400).json({ ResultCode: -1, Message: 'UserName must be at least 3 characters' });
       }
 
-      const user = await database.collections.Users.findOne(
-        { username: { $regex: UserName, $options: 'i' } },
-        { projection: { userProfile: 1 } }
-      );
+      const user = await database.collections.Users.findOne({
+        username: { $regex: UserName, $options: 'i' }
+      }).project({
+        userProfile: 1
+      });
 
       if (!user) {
-        Console.log("Friends", `User not found: ${UserName}`);
-        return res.status(404).json({ message: 'User not found' });
+        return res.status(404).json({ ResultCode: -1, Message: 'User not found' });
       }
 
-      return res.status(200).json(user.userProfile);
+      return res.status(200).json({
+        ResultCode: 1,
+        User: user.userProfile
+      });
     } catch (err) {
-      Console.error('Friends', 'Friends Search error:', err);
-      return res.status(500).json({ message: 'Internal server error' });
+      Console.error('Friends', 'Search error:', err);
+      return res.status(500).json({ ResultCode: -1, Message: 'Internal server error' });
     }
   }
 }
 
 class NewsController {
-
-  // GET /news
   static async GetNews(req, res) {
     try {
       const newsList = await database.collections.News
@@ -2770,59 +1781,19 @@ class NewsController {
         .sort({ timestamp: -1 })
         .toArray();
 
-      const news = newsList.map(news => {
-        const ts = news.timestamp;
-        const isMs = ts > 9999999999;
-        const date = new Date(isMs ? ts : ts * 1000);
-
-        return {
-          Header: news.header,
-          Message: news.message,
-          Date: date.toLocaleString('en-US', {
-            timeZone: 'UTC',
-            year: 'numeric',
-            month: '2-digit',
-            day: '2-digit',
-            hour: '2-digit',
-            minute: '2-digit'
-          })
-        };
-      });
+      const news = newsList.map(news => ({
+        Header: news.header,
+        Message: news.message,
+        TimeStamp: news.timestamp
+      }));
 
       res.json(news);
     } catch (err) {
-      console.error('News Get error:', err);
+      Console.error('News', 'Get error:', err);
       res.status(500).json({ message: 'Error fetching news' });
     }
   }
-
-  // POST /news
-  static async CreateNews(req, res) {
-    try {
-      const { header, message } = req.body;
-
-      if (!header || !message) {
-        return res.status(400).json({ message: "Header and message required" });
-      }
-
-      const news = {
-        header,
-        message,
-        timestamp: Date.now()
-      };
-
-      await database.collections.News.insertOne(news);
-
-      res.json({ success: true, news });
-    } catch (err) {
-      console.error('News Create error:', err);
-      res.status(500).json({ message: 'Error creating news' });
-    }
-  }
-
 }
-
-module.exports = NewsController;
 
 class MissionsController {
   static async getMissions(req, res) {
@@ -2854,7 +1825,7 @@ class MissionsController {
         missionsProgressionsUpdated: missions
       });
     } catch (err) {
-      console.error('Missions', 'Get error:', err);
+      Console.error('Missions', 'Get error:', err);
       res.status(500).json({ message: 'Internal server error' });
     }
   }
@@ -2886,7 +1857,7 @@ class MissionsController {
         message: 'Rewards claimed successfully'
       });
     } catch (err) {
-      console.error('Missions', 'Claim error:', err);
+      Console.error('Missions', 'Claim error:', err);
       res.status(500).json({ message: 'Internal server error' });
     }
   }
@@ -2920,7 +1891,7 @@ class MissionsController {
         message: 'Milestone rewards claimed successfully'
       });
     } catch (err) {
-      console.error('Missions', 'Claim milestone error:', err);
+      Console.error('Missions', 'Claim milestone error:', err);
       res.status(500).json({ message: 'Internal server error' });
     }
   }
@@ -2932,181 +1903,37 @@ class TournamentXController {
       id: 1,
       type: 1,
       isEnabled: true,
-      minVersion: "0.64",
+      minVersion: "0.56",
       startTime: new Date(),
-      endTime: new Date(Date.now() + 5 * 365 * 24 * 60 * 60 * 1000),
-      nameKey: "League BDL 1v1 Duels",
-      descriptionKey: "(.gg/sgleague) - Compete in free-for-all matches, be the last one standing to win!",
-      listItemBackgroundImage: "STPBlockDash_Background_Image_Tournaments_Card",
-      detailsPanelBackgroundImage: "STPBlockDash_Background_Image_Tournaments",
-prizeBannerColour: "#4FC3FF",
-headerColour: "#6FD0FF",
-mapListGradientColourTop: "#8BDFFF",
-mapListGradientColourBottom: "#3BA8FF",
+      endTime: new Date(Date.now() + 365 * 24 * 60 * 60 * 1000),
+      nameKey: "StumbleRace 1v1",
+      descriptionKey: "Practice your skills in the StumbleRace 1v1 TournamentX! mode!",
+      listItemBackgroundImage: "SharkTanic_Background_Image_Tournaments_Card",
+      detailsPanelBackgroundImage: "SharkTanic_Background_Image_Tournaments",
+      prizeBannerColour: "#005577",
+      headerColour: "#007799",
+      mapListGradientColourTop: "#004466",
+      mapListGradientColourBottom: "#002233",
       listPriority: 1,
       minPlayers: 2,
       maxPlayers: 2,
       maxRounds: 1,
-      minMatchmakingSeconds: 5,
+      minMatchmakingSeconds: 2,
       entryCurrencyType: "gems",
-      entryCurrencyCost: 50,
-      entryCurrencyType2: "dust",
-      entryCurrencyCost2: 1,
-      areEmotesRestricted: true,
-      prohibitedEmotes: [2, 4, 5, 6],
-detailsPanelBorderColourTop: "#6FD0FF",
-detailsPanelBorderColourBottom: "#3BA8FF",
-colourData: {
-  detailsPanelMainColour: "#4FC3FF",
-  detailsPanelBorderColour: "#6FD0FF",
-  headerGradientRight: "#4FC3FF",
-  headerGradientLeft: "#6FD0FF",
-  infoWidgetsGradientRight: "#4FC3FF",
-  infoWidgetsGradientLeft: "#3BA8FF",
-  infoWidgetsBorderColour: "#6FD0FF"
-},
-
-      rounds: [
-        {
-          roundOrder: 1,
-          maxPlayersToProgress: 1,
-          minPlayersPerMatch: 2,
-          maxPlayersPerMatch: 5,
-          areLevelsRestricted: true,
-          permittedLevels: ["eventlevel13_block_legendary"]
-        }
-      ],
-      awards: [
-        {
-          placementRangeLowest: 1,
-          placementRangeHighest: 1,
-          awardId: 4,
-          type: "CURRENCY",
-          amount: 500,
-          awardJson: { name: "gems" }
-        },
-        {
-          placementRangeLowest: 1,
-          placementRangeHighest: 1,
-          awardId: 2,
-          type: "CURRENCY", 
-          amount: 15,
-          awardJson: { name: "trophies" }
-        }
-      ]
-    },
-    {
-      id: 2,
-      type: 1,
-      isEnabled: true,
-      minVersion: "0.64",
-      startTime: new Date(),
-      endTime: new Date(Date.now() + 5 * 365 * 24 * 60 * 60 * 1000),
-      nameKey: "League BD 1v1 Duels",
-      descriptionKey: "(.gg/sgleague) - Fast 1v1 duels. Pure skill. Only victory.",
-      listItemBackgroundImage: "Punchapalooza_Background_Image_Tournaments_Card",
-      detailsPanelBackgroundImage: "Punchapalooza_Background_Image_Tournaments",
-prizeBannerColour: "#328bffff",
-headerColour: "#328bffff",
-mapListGradientColourTop: "#328bffff",
-mapListGradientColourBottom: "#328bffff",
-      listPriority: 2,
-      minPlayers: 2,
-      maxPlayers: 2,
-      maxRounds: 1,
-      minMatchmakingSeconds: 10,
-      entryCurrencyType: "gems",
-      entryCurrencyCost: 50,
-      entryCurrencyType2: "tournament_ticket_legendary",
-      entryCurrencyCost2: 1,
-      areEmotesRestricted: true,
-      prohibitedEmotes: [2, 4, 5, 6],
-detailsPanelBorderColourTop: "#328bffff",
-detailsPanelBorderColourBottom: "#328bffff",
-colourData: {
-  detailsPanelMainColour: "#328bffff",
-  detailsPanelBorderColour: "#328bffff",
-  headerGradientRight: "#328bffff",
-  headerGradientLeft: "#328bffff",
-  infoWidgetsGradientRight: "#328bfffff",
-  infoWidgetsGradientLeft: "#328bffff",
-  infoWidgetsBorderColour: "#328bffff"
-},
-
-      rounds: [
-        {
-          roundOrder: 1,
-          maxPlayersToProgress: 1,
-          minPlayersPerMatch: 2,
-          maxPlayersPerMatch: 5,
-          areLevelsRestricted: true,
-          permittedLevels: ["level19_block"]
-        }
-      ],
-      awards: [
-        {
-          placementRangeLowest: 1,
-          placementRangeHighest: 1,
-          awardId: 4,
-          type: "CURRENCY",
-          amount: 450,
-          awardJson: { name: "gems" }
-        },
-        {
-          placementRangeLowest: 1,
-          placementRangeHighest: 1,
-          awardId: 2,
-          type: "CURRENCY",
-          amount: 50,
-          awardJson: { name: "trophies" }
-        },
-        {
-          placementRangeLowest: 1,
-          placementRangeHighest: 1,
-          awardId: 3,
-          type: "CURRENCY",
-          amount: 5,
-          awardJson: { name: "crowns" }
-        }
-      ]
-    },
-    {
-      id: 54,
-      type: 1,
-      isEnabled: true,
-      minVersion: "0.64",
-      startTime: new Date(),
-      endTime: new Date(Date.now() + 5 * 365 * 24 * 60 * 60 * 1000),
-      nameKey: "League RH 1v1 Duels",
-      descriptionKey: "(.gg/sgleague) - Win, Farps and be the best",
-      listItemBackgroundImage: "IceSki_Background_Image_Tournaments_Card",
-      detailsPanelBackgroundImage: "IceSki_Background_Image_Tournaments",
-prizeBannerColour: "#29ffdb3b",
-headerColour: "#32ffd3ff",
-mapListGradientColourTop: "#5bffb2ff",
-mapListGradientColourBottom: "#3cffffff",
-      listPriority: 2,
-      minPlayers: 2,
-      maxPlayers: 2,
-      maxRounds: 1,
-      minMatchmakingSeconds: 10,
-      entryCurrencyType: "gems",
-      entryCurrencyCost: 50,
-      entryCurrencyType2: "tournament_ticket_legendary",
-      entryCurrencyCost2: 1,
-      areEmotesRestricted: true,
-      prohibitedEmotes: [1, 2, 3, 4, 6, 7, 8, 9, 10],
-detailsPanelBorderColourTop: "#6EC9FF",
-detailsPanelBorderColourBottom: "#3DA6FF",
-colourData: {
-  detailsPanelMainColour: "#55BFFF",
-  detailsPanelBorderColour: "#66CCFF",
-  headerGradientRight: "#3DA6FF",
-  headerGradientLeft: "#8ED8FF",
-  infoWidgetsGradientRight: "#4BB7FF",
-  infoWidgetsGradientLeft: "#9BE1FF",
-  infoWidgetsBorderColour: "#8ED8FF"
-},
+      entryCurrencyCost: 0,
+      areEmotesRestricted: false,
+      prohibitedEmotes: [8, 13, 55, 122, 123, 124],
+      detailsPanelBorderColourTop: "#004080",
+      detailsPanelBorderColourBottom: "#002244",
+      colourData: {
+        detailsPanelMainColour: "#003366",
+        detailsPanelBorderColour: "#004080",
+        headerGradientRight: "#003366",
+        headerGradientLeft: "#005599",
+        infoWidgetsGradientRight: "#003366",
+        infoWidgetsGradientLeft: "#002244",
+        infoWidgetsBorderColour: "#004080"
+      },
       rounds: [
         {
           roundOrder: 1,
@@ -3114,114 +1941,78 @@ colourData: {
           minPlayersPerMatch: 2,
           maxPlayersPerMatch: 2,
           areLevelsRestricted: true,
-          permittedLevels: ["level24_streamtiles"]
+          permittedLevels: ["level19_block"]
         }
       ],
       awards: [
-        {
-          placementRangeLowest: 1,
-          placementRangeHighest: 1,
-          awardId: 4,
-          type: "CURRENCY",
-          amount: 400,
-          awardJson: { name: "gems" }
-        },
-        {
-          placementRangeLowest: 1,
-          placementRangeHighest: 1,
-          awardId: 2,
-          type: "CURRENCY",
-          amount: 50,
-          awardJson: { name: "trophies" }
-        },
-        {
-          placementRangeLowest: 1,
-          placementRangeHighest: 1,
-          awardId: 3,
-          type: "CURRENCY",
-          amount: 5,
-          awardJson: { name: "crowns" }
-        }
-      ]
-    }
-  ];
-
-  static seasons = [
+            { placementRangeLowest: 1, placementRangeHighest: 1, awardId: 1, type: "XP", amount: 200 },
+            { placementRangeLowest: 1, placementRangeHighest: 1, awardId: 2, type: "TROPHIES", amount: 15 },
+            { placementRangeLowest: 1, placementRangeHighest: 1, awardId: 3, type: "TOURNAMENTXP", amount: 50 },
+            { placementRangeLowest: 1, placementRangeHighest: 1, awardId: 4, type: "CROWNS", amount: 1 }
+          ],
+      players: [],
+      partys: []
+    },
     {
-      awards: [
-        { amount: 1, awardId: 1, awardJson: { id: "SKIN330" }, type: "SKIN", xp: 5 },
-        { amount: 100, awardId: 2, awardJson: { name: "gems" }, type: "CURRENCY", xp: 10 },
-        { amount: 1, awardId: 3, awardJson: { id: "SKIN438" }, type: "SKIN", xp: 15 },
-        { amount: 1, awardId: 4, awardJson: { id: "Emote047_XmasSkull" }, type: "EMOTE", xp: 20 },
-        { amount: 50, awardId: 5, awardJson: { name: "dust" }, type: "CURRENCY", xp: 25 },
-        { amount: 1, awardId: 6, awardJson: { id: "emote_thumb" }, type: "EMOTE", xp: 30 },
-        { amount: 50, awardId: 7, awardJson: { name: "dusy" }, type: "CURRENCY", xp: 35 },
-        { amount: 1, awardId: 8, awardJson: { id: "SKIN210" }, type: "SKIN", xp: 40 },
-        { amount: 1, awardId: 9, awardJson: { id: "Emote060_HoldingTears" }, type: "EMOTE", xp: 45 },
-        { amount: 1, awardId: 10, awardJson: { id: "SKIN123" }, type: "SKIN", xp: 50 },
-        { amount: 20, awardId: 11, awardJson: { name: "gems" }, type: "CURRENCY", xp: 55 },
-        { amount: 1, awardId: 12, awardJson: { id: "Emote032_RedCard" }, type: "EMOTE", xp: 60 },
-        { amount: 50, awardId: 13, awardJson: { name: "dust" }, type: "CURRENCY", xp: 65 },
-        { amount: 1, awardId: 14, awardJson: { id: "SKIN148" }, type: "SKIN", xp: 70 },
-        { amount: 1, awardId: 15, awardJson: { id: "emote_dab" }, type: "EMOTE", xp: 75 },
-        { amount: 75, awardId: 16, awardJson: { name: "dust" }, type: "CURRENCY", xp: 80 },
-        { amount: 20, awardId: 17, awardJson: { name: "gems" }, type: "CURRENCY", xp: 85 },
-        { amount: 1, awardId: 18, awardJson: { id: "emote_go" }, type: "EMOTE", xp: 90 },
-        { amount: 50, awardId: 19, awardJson: { name: "dust" }, type: "CURRENCY", xp: 95 },
-        { amount: 1, awardId: 20, awardJson: { id: "SKIN365" }, type: "SKIN", xp: 100 },
-        { amount: 10, awardId: 21, awardJson: { name: "gems" }, type: "CURRENCY", xp: 105 },
-        { amount: 50, awardId: 22, awardJson: { name: "gems" }, type: "CURRENCY", xp: 110 },
-        { amount: 1, awardId: 23, awardJson: { id: "emote_skull" }, type: "EMOTE", xp: 115 },
-        { amount: 1, awardId: 24, awardJson: { id: "SKIN195" }, type: "SKIN", xp: 120 },
-        { amount: 50, awardId: 25, awardJson: { name: "dust" }, type: "CURRENCY", xp: 125 },
-        { amount: 20, awardId: 26, awardJson: { name: "gems" }, type: "CURRENCY", xp: 130 },
-        { amount: 1, awardId: 27, awardJson: { id: "SKIN51" }, type: "SKIN", xp: 135 },
-        { amount: 1, awardId: 28, awardJson: { id: "Emote057_PartyPop" }, type: "EMOTE", xp: 140 },
-        { amount: 50, awardId: 29, awardJson: { name: "dust" }, type: "CURRENCY", xp: 145 },
-        { amount: 1, awardId: 30, awardJson: { id: "SKIN444" }, type: "SKIN", xp: 150 },
-        { amount: 1, awardId: 999, awardJson: { id: "SKIN375" }, type: "SKIN", xp: 999 }
-      ],
-      backgroundImageKey: "",
-      descriptionKey: "",
-      endTime: "2026-04-03T10:00:00",
-      id: 1,
+      id: 2,
+      type: 1,
       isEnabled: true,
-      nameKey: "TOURNAMENTS",
-      claimSeasonReward: true,
-      startTime: "2024-03-06T10:00:00"
+      minVersion: "0.56",
+      startTime: new Date(),
+      endTime: new Date(Date.now() + 365 * 24 * 60 * 60 * 1000),
+      nameKey: "StumbleRush 1v1 ",
+      descriptionKey: "Practice your skills in the StumbleRace 2v2 TournamentX! mode!",
+      listItemBackgroundImage: "AbductedAvenue_Background_Image_Tournaments_Card",
+      detailsPanelBackgroundImage: "Barbie_Background_Image_Tournaments",
+      prizeBannerColour: "#005577",
+      headerColour: "#007799",
+      mapListGradientColourTop: "#33ff55ff",
+      mapListGradientColourBottom: "#002233",
+      listPriority: 0,
+      minPlayers: 2,
+      maxPlayers: 2,
+      maxRounds: 1,
+      minMatchmakingSeconds: 2,
+      entryCurrencyType: "gems",
+      entryCurrencyCost: 0,
+      areEmotesRestricted: false,
+      prohibitedEmotes: [7],
+      detailsPanelBorderColourTop: "#004080",
+      detailsPanelBorderColourBottom: "#002244",
+      colourData: {
+        detailsPanelMainColour: "#003366",
+        detailsPanelBorderColour: "#33ffccff",
+        headerGradientRight: "#07cc00ff",
+        headerGradientLeft: "#33ffa0ff",
+        infoWidgetsGradientRight: "#00cc22ff",
+        infoWidgetsGradientLeft: "#0d9900ff",
+        infoWidgetsBorderColour: "#33ff66ff"
+      },
+      rounds: [
+        {
+          roundOrder: 1,
+          maxPlayersToProgress: 1,
+          minPlayersPerMatch: 2,
+          maxPlayersPerMatch: 2,
+          areLevelsRestricted: true,
+          permittedLevels: ["eventlevel13_block_legendary"]
+        }
+      ],
+      awards: [
+            { placementRangeLowest: 1, placementRangeHighest: 1, awardId: 1, type: "XP", amount: 200 },
+            { placementRangeLowest: 1, placementRangeHighest: 1, awardId: 2, type: "TROPHIES", amount: 15 },
+            { placementRangeLowest: 1, placementRangeHighest: 1, awardId: 3, type: "TOURNAMENTXP", amount: 50 },
+            { placementRangeLowest: 1, placementRangeHighest: 1, awardId: 4, type: "CROWNS", amount: 1 }
+          ],
+      players: [],
+      partys: []
     }
   ];
 
-  static getSeasons(req, res) {
-    try {
-      res.status(200).json(TournamentXController.seasons);
-    } catch (err) {
-      res.status(500).json({ message: "erro interno" });
-    }
-  }
-
-  static generateEncryptedEntry(partyData, userData) {
-    const dataToEncrypt = {
-      partyId: partyData.partyId,
-      tournamentId: partyData.tournamentId,
-      userId: userData.id,
-      stumbleId: userData.stumbleId,
-      username: userData.username,
-      timestamp: Date.now(),
-      players: partyData.players.map(p => ({
-        stumbleId: p.stumbleId,
-        username: p.username
-      }))
-    };
-
-    const jsonString = JSON.stringify(dataToEncrypt);
-    return CryptoUtils.Encrypt(jsonString);
-  }
-
-  static  getActive(req, res) {
+  static getActive(req, res) {
     try {
       const now = new Date();
-      res.status(200).json({ AreAdditionalTournamentsVersionRestricted: false, UserActiveTournaments: TournamentXController.tournaments });
+      res.status(200).json(TournamentXController.tournaments);
     } catch (err) {
       console.error("erro:", err);
       res.status(500).json({ message: "erro interno" });
@@ -3235,92 +2026,94 @@ colourData: {
       const tournament = TournamentXController.tournaments.find(t => t.id === tournamentId);
 
       if (!tournament) {
-        Console.log("LeagueArena", `Tournament not found: ${tournamentId}`);
         return res.status(404).json({ message: "torneio nao encontrado" });
       }
+
       if (!tournament.isEnabled) {
-        Console.log("LeagueArena", `Tournament disabled: ${tournamentId}`);
         return res.status(400).json({ message: "torneio desativado" });
       }
 
       const now = new Date();
       if (now < tournament.startTime || now > tournament.endTime) {
-        Console.log("LeagueArena", `Tournament not active: ${tournamentId}`);
         return res.status(400).json({ message: "torneio nao esta ativo no momento" });
       }
 
       if (tournament.entryCurrencyCost > 0) {
         const userBalance = UserModel.getBalanceAmount(user, tournament.entryCurrencyType);
         if (userBalance < tournament.entryCurrencyCost) {
-          Console.log("LeagueArena", `Insufficient balance for user ${user.username} to join tournament ${tournamentId}`);
           return res.status(400).json({
             message: `saldo insuficiente de ${tournament.entryCurrencyType}`
           });
         }
+
         await UserModel.removeBalance(user.deviceId, tournament.entryCurrencyType, tournament.entryCurrencyCost);
       }
 
-      const existingParty = await database.collections.Parties.findOne({
-        tournamentId: tournament.id,
-        "players.stumbleId": user.stumbleId
-      });
-
-      if (existingParty) {
-        await database.collections.Parties.deleteOne({ partyId: existingParty.partyId });
-      }
-
-      let availableParty = await database.collections.Parties.findOne({
-        tournamentId: tournament.id,
-        $expr: { $lt: [{ $size: "$players" }, 5] },
-        status: "waiting"
-      });
-
-      if (!availableParty) {
-        availableParty = {
-          partyId: Math.floor(111, 999),
-          tournamentId: tournament.id,
-          tournamentName: tournament.nameKey,
-          players: [],
-          status: "waiting",
-          createdAt: new Date(),
-          maxPlayers: 5
-        };
-        await database.collections.Parties.insertOne(availableParty);
-      }
-
-      const playerData = {
+      tournament.players.push({
         stumbleId: user.stumbleId,
         userId: user.id,
-        username: user.username,
-        joinedAt: new Date()
-      };
+        username: user.username
+      });
 
-      await database.collections.Parties.updateOne(
-        { partyId: availableParty.partyId },
-        { $push: { players: playerData } }
-      );
+      const entryToken = `tournament-${tournament.id}-${Date.now()}`;
+      const expiryDate = tournament.endTime.toISOString();
 
-      const updatedParty = await database.collections.Parties.findOne({ partyId: availableParty.partyId });
+      const maps = [];
+      const roundsQualified = [];
 
-      if (updatedParty.players.length >= 2) {
-        await database.collections.Parties.updateOne(
-          { partyId: availableParty.partyId },
-          { $set: { status: "full" } }
-        );
+      if (Array.isArray(tournament.rounds)) {
+        for (const round of tournament.rounds) {
+          if (Array.isArray(round.permittedLevels)) {
+            round.permittedLevels.forEach(lvl => maps.push({ id: lvl }));
+          }
+          if (round.maxPlayersToProgress) {
+            roundsQualified.push(round.maxPlayersToProgress);
+          }
+        }
       }
 
-      const encryptedEntry = TournamentXController.generateEncryptedEntry(updatedParty, user);
+      if (!Array.isArray(tournament.partys)) {
+        tournament.partys = [];
+      }
 
-      Console.log("LeagueArena", `User ${user.username} is joining tournament ${tournamentId} in party ${availableParty.partyId}`);
+      const maxPlayers = tournament.maxPlayers || 2;
+      let partyId;
+      let MatchmakerTag;
+      let found = false;
+
+      for (const partyList of tournament.partys) {
+        for (const party of partyList) {
+          if (party.players.length < maxPlayers) {
+            party.players.push(user.stumbleId);
+            MatchmakerTag = party.partyId;
+            partyId = party.partyId;
+            found = true;
+            break;
+          }
+        }
+        if (found) break;
+      }
+
+      if (!found) {
+        const newParty = {
+          partyId: `tournament-${tournament.id}-${Math.floor(Math.random() * 9999)}`,
+          players: [user.stumbleId]
+        };
+        tournament.partys.push([newParty]);
+        MatchmakerTag = newParty.partyId;
+        partyId = newParty.partyId;
+      }
+
       const response = {
-        entryToken: tournamentId + Date.now().toString() + Math.floor(1000, 9999).toString(),
-        MatchmakerTag: availableParty.partyId,
+        entryToken,
+        MatchmakerTag,
         requestId: user.stumbleId
       };
-     Console.log("LeagueArena", `User ${user.username} joined tournament ${tournamentId} in party ${availableParty.partyId}`);
+
+      console.log(`coloquei o ${user.username} na partida ${partyId} no torneio ${tournament.nameKey} com id ${tournament.id} e token ${entryToken}`);
       res.status(200).json(response);
     } catch (err) {
-      console.error(err);
+      console.error("erro ao entrar no torneio:", err);
       res.status(500).json({ message: "erro interno do servidor" });
     }
   }
@@ -3329,29 +2122,28 @@ colourData: {
     try {
       const { user } = req;
       const tournamentId = parseInt(req.params.tournamentId);
-
-      const party = await database.collections.Parties.findOne({
-        tournamentId: tournamentId,
-        "players.stumbleId": user.stumbleId
-      });
-
-      if (party) {
-        await database.collections.Parties.deleteOne({ partyId: party.partyId });
-      }
-
       const tournament = TournamentXController.tournaments.find(t => t.id === tournamentId);
-      if (tournament && tournament.entryCurrencyCost > 0) {
-        await UserModel.addBalance(user.deviceId, tournament.entryCurrencyType, tournament.entryCurrencyCost);
+
+      if (!tournament) {
+        return res.status(404).json({ message: "torneio nao encontrado" });
       }
-      Console.log("LeagueArena", `User ${user.username} left tournament ${tournamentId}`);
-      res.status(200).json({ message: "left" });
+
+      const playerIndex = tournament.players.findIndex(p => p.stumbleId === user.stumbleId);
+      if (playerIndex !== -1) {
+        tournament.players.splice(playerIndex, 1);
+        if (tournament.entryCurrencyCost > 0) {
+          await UserModel.addBalance(user.deviceId, tournament.entryCurrencyType, tournament.entryCurrencyCost);
+        }
+      }
+
+      res.status(200).json({ message: "saiu" });
     } catch (err) {
-      Console.error(err);
-      res.status(500).json({ message: "internal server error" });
+      console.error("tournamentx", "erro ao sair do torneio:", err);
+      res.status(500).json({ message: "erro interno do servidor" });
     }
   }
 
-  static async finish(req, res) {
+static async finish(req, res) {
   try {
     const { Round, TournamentId, EntryToken, SignedPayload } = req.body;
     const { user } = req;
@@ -3374,7 +2166,7 @@ colourData: {
     let pointsChange = 0;
 
     if (roundResult === 1) {
-      gemsChange = 100;
+      gemsChange = 65;
       crownsChange = 1;
       pointsChange = 10;
     } else if (roundResult === 0) {
@@ -3402,41 +2194,6 @@ colourData: {
       await UserModel.addBalance(user.deviceId, "gems", gemsChange);
     }
 
-    // ⭐ XP DA SEASON (SÓ SE GANHAR)
-    if (roundResult === 1) {
-      const seasonId = 1;
-
-      const foundUser = await UserModel.findByStumbleId(user.stumbleId);
-
-      let userSeasonData = foundUser.tournamentSeasons?.find(
-        s => s.seasonId === seasonId
-      );
-
-      if (!userSeasonData) {
-        userSeasonData = {
-          seasonId: seasonId,
-          xp: 0,
-          claimedAwards: []
-        };
-
-        if (!foundUser.tournamentSeasons) {
-          foundUser.tournamentSeasons = [userSeasonData];
-        } else {
-          foundUser.tournamentSeasons.push(userSeasonData);
-        }
-      }
-
-      userSeasonData.xp += 1;
-
-      await UserModel.update(user.stumbleId, {
-        tournamentSeasons: foundUser.tournamentSeasons.map(s =>
-          s.seasonId === seasonId ? userSeasonData : s
-        )
-      });
-    }
-
-    const updatedUser = await UserModel.findByStumbleId(user.stumbleId);
-
     console.log("Finalizei o round do " + user.username);
 
     res.status(200).json({
@@ -3444,8 +2201,7 @@ colourData: {
       Round: roundResult,
       EntryToken,
       SignedPayload,
-      CollectedCurrencies: gemsChange > 0 ? ["gems", gemsChange] : [],
-      User: updatedUser
+      CollectedCurrencies: gemsChange > 0 ? ["gems", gemsChange] : []
     });
 
   } catch (err) {
@@ -3453,284 +2209,45 @@ colourData: {
     res.status(500).json({ mensagem: "erro interno do servidor" });
   }
 }
-
-static async getSeasonProgress(req, res) {
-    try {
-      const { seasonId } = req.params;
-      const { user } = req;
-
-      const foundUser = await UserModel.findByStumbleId(user.stumbleId);
-
-      if (!foundUser) {
-        return res.status(404).json("putz vc n existe");
-      }
-
-      let userSeasonData = foundUser.tournamentSeasons?.find(season =>
-        season.seasonId === parseInt(seasonId)
-      );
-
-      if (!userSeasonData) {
-        userSeasonData = {
-          seasonId: parseInt(seasonId),
-          xp: 0,
-          claimedAwards: []
-        };
-
-        if (!foundUser.tournamentSeasons) {
-          foundUser.tournamentSeasons = [userSeasonData];
-        } else {
-          foundUser.tournamentSeasons.push(userSeasonData);
-        }
-
-        await UserModel.update(user.stumbleId, {
-          tournamentSeasons: foundUser.tournamentSeasons
-        });
-      }
-
-      const seasonProgress = {
-        seasonId: parseInt(seasonId),
-        userId: foundUser.id,
-        xp: userSeasonData.xp,
-        claimedAwards: userSeasonData.claimedAwards
-      };
-
-      res.status(200).json(seasonProgress);
-
-    } catch (err) {
-      Console.error('Tournament', 'Get season progress error:', err);
-      res.status(500).json({ message: 'Internal server error' });
-    }
-  }
-
-  static async claimSeasonReward(req, res) {
-    try {
-      const { seasonId, awardId } = req.params;
-      const { user } = req;
-
-      const foundUser = await UserModel.findByStumbleId(user.stumbleId);
-      if (!foundUser) {
-        return res.status(404).json({ message: "User not found" });
-      }
-
-      const season = TournamentXController.seasons.find(s => s.id === parseInt(seasonId));
-      if (!season) {
-        return res.status(404).json({ message: "Season not found" });
-      }
-
-      const award = season.awards.find(a => a.awardId === parseInt(awardId));
-      if (!award) {
-        return res.status(404).json({ message: "Award not found" });
-      }
-
-      let userSeasonData = foundUser.tournamentSeasons?.find(s => s.seasonId === parseInt(seasonId));
-
-      if (!userSeasonData) {
-        userSeasonData = {
-          seasonId: parseInt(seasonId),
-          xp: 0,
-          claimedAwards: []
-        };
-
-        if (!foundUser.tournamentSeasons) {
-          foundUser.tournamentSeasons = [userSeasonData];
-        } else {
-          foundUser.tournamentSeasons.push(userSeasonData);
-        }
-
-        await UserModel.update(user.stumbleId, {
-          tournamentSeasons: foundUser.tournamentSeasons
-        });
-      }
-
-      if (userSeasonData.xp < award.xp) {
-        return res.status(400).json({ message: "Insufficient XP to claim this award" });
-      }
-
-      if (userSeasonData.claimedAwards.includes(parseInt(awardId))) {
-        return res.status(400).json({ message: "Award already claimed" });
-      }
-
-      let rewards = [];
-
-      if (award.type === "CURRENCY") {
-        const currencyName = award.awardJson.name;
-        const currencyReward = {
-          amount: award.amount,
-          duplicateCurrencyAmount: 0,
-          nestedRewards: [],
-          sourceType: "TOURNAMENT_SEASON",
-          type: "CURRENCY",
-          typeInfo: currencyName
-        };
-        rewards.push(currencyReward);
-        await UserModel.addBalance(user.stumbleId, currencyName, award.amount);
-      } else if (award.type === "SKIN") {
-        const skinId = award.awardJson.id;
-        const wheelReward = {
-          amount: 1,
-          duplicateCurrencyAmount: 0,
-          nestedRewards: [
-            {
-              amount: 1,
-              duplicateCurrencyAmount: 0,
-              nestedRewards: [],
-              sourceType: "UNKNOWN",
-              type: "SKIN",
-              typeInfo: skinId
-            }
-          ],
-          sourceType: "TOURNAMENT_SEASON",
-          type: "WHEEL",
-          typeInfo: "TOURNAMENT_SEASON_WHEEL"
-        };
-        rewards.push(wheelReward);
-        await UserModel.addSkin(user.stumbleId, skinId);
-      } else if (award.type === "EMOTE") {
-        const emoteId = award.awardJson.id;
-        const wheelReward = {
-          amount: 1,
-          duplicateCurrencyAmount: 0,
-          nestedRewards: [
-            {
-              amount: 1,
-              duplicateCurrencyAmount: 0,
-              nestedRewards: [],
-              sourceType: "UNKNOWN",
-              type: "EMOTE",
-              typeInfo: emoteId
-            }
-          ],
-          sourceType: "TOURNAMENT_SEASON",
-          type: "WHEEL",
-          typeInfo: "TOURNAMENT_SEASON_WHEEL"
-        };
-        rewards.push(wheelReward);
-        await database.addToUserArray({ stumbleId: user.stumbleId }, 'emotes', emoteId);
-      } else if (award.type === "FOOTSTEPS") {
-        const footstepId = award.awardJson.id;
-        const wheelReward = {
-          amount: 1,
-          duplicateCurrencyAmount: 0,
-          nestedRewards: [
-            {
-              amount: 1,
-              duplicateCurrencyAmount: 0,
-              nestedRewards: [],
-              sourceType: "UNKNOWN",
-              type: "FOOTSTEPS",
-              typeInfo: footstepId
-            }
-          ],
-          sourceType: "TOURNAMENT_SEASON",
-          type: "WHEEL",
-          typeInfo: "TOURNAMENT_SEASON_WHEEL"
-        };
-        rewards.push(wheelReward);
-        await database.addToUserArray({ stumbleId: user.stumbleId }, 'footsteps', footstepId);
-      }
-
-      userSeasonData.claimedAwards.push(parseInt(awardId));
-      await UserModel.update(user.stumbleId, {
-        tournamentSeasons: foundUser.tournamentSeasons.map(s =>
-          s.seasonId === parseInt(seasonId) ? userSeasonData : s
-        )
-      });
-
-      const updatedUser = await UserModel.findByStumbleId(user.stumbleId);
-      res.status(200).json({
-        User: updatedUser,
-        Rewards: rewards
-      });
-
-    } catch (err) {
-      Console.error("TournamentX", "Error claiming season reward:", err);
-      res.status(500).json({ message: "Internal server error" });
-    }
-  }
-  
-
-  static async getPartyInfo(req, res) {
-    try {
-      const { user } = req;
-      const tournamentId = parseInt(req.params.tournamentId);
-
-      const party = await database.collections.Parties.findOne({
-        tournamentId: tournamentId,
-        "players.stumbleId": user.stumbleId
-      });
-
-      if (!party) {
-        Console.log("LeagueArena", `User ${user.username} is not in any party for tournament ${tournamentId}`);
-        return res.status(404).json({ message: "nao esta em nenhuma partida" });
-      }
-
-      res.status(200).json({
-        partyId: party.partyId,
-        tournamentId: party.tournamentId,
-        players: party.players,
-        status: party.status,
-        createdAt: party.createdAt
-      });
-    } catch (err) {
-      Console.error("LeagueArena", "Error fetching party info:", err);
-      res.status(500).json({ message: "erro interno do servidor" });
-    }
-  }
-
-  static async cleanupParties() {
-    try {
-      const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000);
-      
-      await database.collections.Parties.deleteMany({
-        createdAt: { $lt: oneHourAgo },
-        status: { $in: ["waiting", "finished"] }
-      });
-Console.log("LeagueArena", "Cleaning up old parties");
-    } catch (err) {
-      Console.error("LeagueArena", "Error cleaning up parties:", err);
-    }
-  }
 }
-
-setInterval(() => {
-  TournamentXController.cleanupParties();
-}, 30 * 60 * 1000);
 
 class MatchmakingController {
   static async getMatchmakingFilter(req, res) {
     try {
       const { deviceId } = req.query;
-      
+
       if (!deviceId) {
-        Console.error('Matchmaking', 'Missing deviceId in request');
-        return res.status(400).json({ 
+        return res.status(400).json({
           error: "Bad Request",
-          message: "deviceId query parameter is required" 
+          message: "deviceId query parameter is required"
         });
       }
 
       const user = await UserModel.findByDeviceId(deviceId);
-      
+
       if (!user) {
-        Console.error('Matchmaking', `User not found for deviceId: ${deviceId}`);
-        return res.status(404).json({ 
+        return res.status(404).json({
           error: "Not Found",
-          message: "User not found" 
+          message: "User not found"
         });
       }
 
       const sharedType = process.env.sharedType || 'NULL';
-      const version = user.version;
+      const version = user.version || '0';
+      const platform = user.userProfile?.nativePlatformName || 'null';
+      const skillTier = Math.floor((user.skillRating || 0) / 1000);
+      const regionCodes = ['na', 'eu', 'as', 'sa', 'af', 'oc', 'ae'];
+      const region = regionCodes[Math.floor(Math.random() * regionCodes.length)];
 
-      const matchmakingFilter = `$StumbleLeague_${version}_${sharedType}`;
+      const matchmakingFilter = `${sharedType}_${version}_${platform}_${skillTier}_${region}`;
 
       return res.status(200).json({ matchmakingFilter });
-      
+
     } catch (err) {
       Console.error('Matchmaking', 'Filter error:', err);
-      return res.status(500).json({ 
+      return res.status(500).json({
         error: "Internal Server Error",
-        message: "An error occurred while generating matchmaking filter" 
+        message: "An error occurred while generating matchmaking filter"
       });
     }
   }
@@ -3742,35 +2259,32 @@ class SocialController {
     try {
       const { user } = req;
 
-      const friendIds = Array.isArray(user.friends) ? user.friends : [];
-      const receivedRequests = Array.isArray(user.receivedFriendRequests) ? user.receivedFriendRequests : [];
-      const receivedPartyInvites = Array.isArray(user.receivedPartyInvites) ? user.receivedPartyInvites : [];
-
-      const friends = await database.collections.Users.find({ 
-        stumbleId: { $in: friendIds } 
-      }).project({ 
-        id: 1,
-        username: 1, 
-        stumbleId: 1, 
-        country: 1, 
-        skillRating: 1,
-        crowns: 1,
-        experience: 1,
-        equippedCosmetics: 1,
-        lastLogin: 1
-      }).toArray();
+      const friendIds = user.friends || [];
+      const friends = await database.collections.Users.find({ stumbleId: { $in: friendIds } })
+        .project({
+          id: 1,
+          username: 1,
+          stumbleId: 1,
+          country: 1,
+          skillRating: 1,
+          crowns: 1,
+          experience: 1,
+          'equippedCosmetics.skin': 1,
+          lastLogin: 1
+        })
+        .toArray();
 
       const friendProfiles = friends.map(friend => ({
-        userId: friend.id || 0,
-        userName: friend.username || 'Unknown',
+        userId: friend.id,
+        userName: friend.username,
         title: "",
-        country: friend.country || 'Unknown',
-        trophies: friend.skillRating || 0,
-        crowns: friend.crowns || 0,
-        experience: friend.experience || 0,
-        hiddenRating: Math.floor((friend.skillRating || 0) / 10),
+        country: friend.country,
+        trophies: friend.skillRating,
+        crowns: friend.crowns,
+        experience: friend.experience,
+        hiddenRating: Math.floor(friend.skillRating / 10),
         isOnline: true,
-        lastSeenDate: friend.lastLogin ? friend.lastLogin.toISOString() : new Date().toISOString(),
+        lastSeenDate: friend.lastLogin.toISOString(),
         skin: friend.equippedCosmetics?.skin || 'SKIN1',
         nativePlatformName: "android",
         ranked: {
@@ -3781,6 +2295,8 @@ class SocialController {
         flags: 0
       }));
 
+
+      const receivedRequests = user.receivedFriendRequests || [];
       const pendingUsers = await database.collections.Users.find({
         stumbleId: { $in: receivedRequests }
       }).project({
@@ -3790,21 +2306,21 @@ class SocialController {
         skillRating: 1,
         crowns: 1,
         experience: 1,
-        equippedCosmetics: 1,
+        'equippedCosmetics.skin': 1,
         lastLogin: 1
       }).toArray();
 
       const friendRequestProfiles = pendingUsers.map(u => ({
-        userId: u.id || 0,
-        userName: u.username || 'Unknown',
+        userId: u.id,
+        userName: u.username,
         title: "",
-        country: u.country || 'Unknown',
-        trophies: u.skillRating || 0,
-        crowns: u.crowns || 0,
-        experience: u.experience || 0,
-        hiddenRating: Math.floor((u.skillRating || 0) / 10),
+        country: u.country,
+        trophies: u.skillRating,
+        crowns: u.crowns,
+        experience: u.experience,
+        hiddenRating: Math.floor(u.skillRating / 10),
         isOnline: true,
-        lastSeenDate: u.lastLogin ? u.lastLogin.toISOString() : new Date().toISOString(),
+        lastSeenDate: u.lastLogin.toISOString(),
         skin: u.equippedCosmetics?.skin || 'SKIN1',
         nativePlatformName: "android",
         ranked: {
@@ -3815,18 +2331,12 @@ class SocialController {
         flags: 0
       }));
 
-      const excludeIds = [...friendIds, ...receivedRequests, user.stumbleId].filter(id => id);
 
       const recommendedUsers = await database.collections.Users.aggregate([
-        { 
-          $match: { 
-            stumbleId: { 
-              $exists: true,
-              $nin: excludeIds.length > 0 ? excludeIds : ['non-existent-id'] 
-            },
-            country: { $exists: true }
-          }
-        },
+        { $match: {
+          stumbleId: { $nin: [...friendIds, ...receivedRequests, user.stumbleId] },
+          country: { $exists: true }
+        }},
         { $sample: { size: 5 } },
         { $project: {
           id: 1,
@@ -3835,7 +2345,7 @@ class SocialController {
           skillRating: 1,
           crowns: 1,
           experience: 1,
-          equippedCosmetics: 1,
+          'equippedCosmetics.skin': 1,
           lastLogin: 1
         }}
       ]).toArray();
@@ -3843,23 +2353,21 @@ class SocialController {
       const recommendedProfiles = recommendedUsers.map(u => {
         const tags = [];
         if (u.country === user.country) tags.push("SAME_COUNTRY");
-        if (Math.abs((u.skillRating || 0) - (user.skillRating || 0)) < 200) {
-          tags.push("SIMILAR_SKILL");
-        }
+        if (Math.abs((u.skillRating || 0) - (user.skillRating || 0)) < 200) tags.push("SIMILAR_SKILL");
 
         return {
           tags: tags.length > 0 ? tags : ["SIMILAR_SKILL"],
           userProfile: {
-            userId: u.id || 0,
-            userName: u.username || 'Unknown',
+            userId: u.id,
+            userName: u.username,
             title: "",
-            country: u.country || 'Unknown',
-            trophies: u.skillRating || 0,
-            crowns: u.crowns || 0,
-            experience: u.experience || 0,
-            hiddenRating: Math.floor((u.skillRating || 0) / 10),
+            country: u.country,
+            trophies: u.skillRating,
+            crowns: u.crowns,
+            experience: u.experience,
+            hiddenRating: Math.floor(u.skillRating / 10),
             isOnline: true,
-            lastSeenDate: u.lastLogin ? u.lastLogin.toISOString() : new Date().toISOString(),
+            lastSeenDate: u.lastLogin.toISOString(),
             skin: u.equippedCosmetics?.skin || 'SKIN1',
             nativePlatformName: "android",
             ranked: {
@@ -3872,65 +2380,30 @@ class SocialController {
         };
       });
 
-      const partyInviteDetails = await Promise.all(
-        receivedPartyInvites.map(async (invite) => {
-          const fromUser = await database.collections.Users.findOne({ stumbleId: invite.fromStumbleId });
-          return {
-            fromUserId: invite.fromUserId,
-            fromUsername: invite.fromUsername,
-            fromStumbleId: invite.fromStumbleId,
-            sentAt: invite.sentAt,
-            fromUserProfile: fromUser ? {
-              userId: fromUser.id || 0,
-              userName: fromUser.username || 'Unknown',
-              title: "",
-              country: fromUser.country || 'Unknown',
-              trophies: fromUser.skillRating || 0,
-              crowns: fromUser.crowns || 0,
-              experience: fromUser.experience || 0,
-              hiddenRating: Math.floor((fromUser.skillRating || 0) / 10),
-              isOnline: true,
-              lastSeenDate: fromUser.lastLogin ? fromUser.lastLogin.toISOString() : new Date().toISOString(),
-              skin: fromUser.equippedCosmetics?.skin || 'SKIN1',
-              nativePlatformName: "android",
-              ranked: {
-                currentSeasonId: "LIVE_RANKED_SEASON_12",
-                currentRankId: 0,
-                currentTierIndex: 0
-              },
-              flags: 0
-            } : null
-          };
-        })
-      );
-
-      res.status(200).json({
+      res.json({
         friends: friendProfiles,
         friendRequests: friendRequestProfiles,
-        partyInvites: partyInviteDetails,
+        partyInvites: [],
         recommendedFriends: recommendedProfiles
       });
-
     } catch (err) {
-      Console.error('Social', 'Get interactions error:', err);
-      Console.log('Social', 'Error details:', err);
-      res.status(500).json({
-        message: 'erro interno',
-        error: err.message 
-      });
+      Console.error('Social', 'Interactions error:', err);
+      res.status(500).json({ message: 'Internal server error' });
     }
   }
 }
+
 
 class TournamentController {
     static async login(req, res) {
         try {
             const user = await UserModel.findByDeviceId(req.user.deviceId);
-            
-            return res.status(200).json({
-                userId: user.id,
-                clientToken: user.token,
-                photonJwt: user.photonJwt
+            const photonJwt = await generatePhotonJwt(user);
+
+            return res.json({
+                User: user,
+                PhotonJwt: photonJwt,
+                equippedCosmetics: user.equippedCosmetics
             });
 
         } catch (error) {
@@ -3942,7 +2415,7 @@ class TournamentController {
     static async createTournament(req, res) {
         try {
             const { name, description, startTime, endTime, entryFee, maxPlayers, rewards } = req.body;
-            
+
             if (!name || !startTime || !endTime) {
                 return res.status(400).json({ message: 'Name, startTime and endTime are required' });
             }
@@ -3963,7 +2436,7 @@ class TournamentController {
             };
 
             const result = await database.collections.Tournaments.insertOne(tournament);
-            
+
             if (result.acknowledged) {
                 res.status(201).json({
                     message: 'Tournament created successfully',
@@ -3997,13 +2470,13 @@ class TournamentController {
     static async getTournamentById(req, res) {
         try {
             const { id } = req.params;
-            
+
             if (!id) {
                 return res.status(400).json({ message: 'Tournament ID is required' });
             }
 
             const tournament = await database.collections.Tournaments.findOne({ id });
-            
+
             if (!tournament) {
                 return res.status(404).json({ message: 'Tournament not found' });
             }
@@ -4024,7 +2497,7 @@ class TournamentController {
                 return res.status(400).json({ message: 'Tournament ID is required' });
             }
 
-            const tournament = await database.collections.Tournaments.findOne({ 
+            const tournament = await database.collections.Tournaments.findOne({
                 id: tournamentId,
                 isActive: true
             });
@@ -4056,7 +2529,7 @@ class TournamentController {
                 if (userBalance < tournament.entryFee) {
                     return res.status(400).json({ message: 'Not enough gems to join tournament' });
                 }
-                
+
                 await UserModel.removeBalance(user.stumbleId, 'gems', tournament.entryFee);
             }
 
@@ -4102,7 +2575,7 @@ class TournamentController {
                 return res.status(400).json({ message: 'Invalid score' });
             }
 
-            const tournament = await database.collections.Tournaments.findOne({ 
+            const tournament = await database.collections.Tournaments.findOne({
                 id: tournamentId,
                 isActive: true
             });
@@ -4117,7 +2590,7 @@ class TournamentController {
             });
 
             if (!participation) {
-                return res.status(400).json({ message: 'You have not joined this tournament' });
+                return res.status(400).json({ message: 'You did not participate in this tournament' });
             }
 
             await database.collections.TournamentParticipants.updateOne(
@@ -4147,7 +2620,7 @@ class TournamentController {
                 return res.status(400).json({ message: 'Tournament ID is required' });
             }
 
-            const tournament = await database.collections.Tournaments.findOne({ 
+            const tournament = await database.collections.Tournaments.findOne({
                 id: tournamentId
             });
 
@@ -4182,7 +2655,7 @@ class TournamentController {
 
                 await Promise.all(leaderboard.map(async (entry, index) => {
                     await database.collections.TournamentParticipants.updateOne(
-                        { 
+                        {
                             tournamentId,
                             userId: entry.userId
                         },
@@ -4212,7 +2685,7 @@ class TournamentController {
                 return res.status(400).json({ message: 'Tournament ID is required' });
             }
 
-            const tournament = await database.collections.Tournaments.findOne({ 
+            const tournament = await database.collections.Tournaments.findOne({
                 id: tournamentId
             });
 
@@ -4238,8 +2711,8 @@ class TournamentController {
                 return res.status(400).json({ message: 'You have already claimed your rewards' });
             }
 
-            const reward = tournament.rewards.find(r => 
-                participation.position >= r.positionRangeLowest && 
+            const reward = tournament.rewards.find(r =>
+                participation.position >= r.positionRangeLowest &&
                 participation.position <= r.positionRangeHighest
             );
 
@@ -4281,12 +2754,10 @@ class TournamentController {
             const updates = req.body;
 
             if (!id) {
-                Console.error('Tournament', 'Tournament ID is required');
                 return res.status(400).json({ message: 'Tournament ID is required' });
             }
 
             if (Object.keys(updates).length === 0) {
-                Console.error('Tournament', 'No updates provided');
                 return res.status(400).json({ message: 'No updates provided' });
             }
 
@@ -4319,23 +2790,21 @@ class TournamentController {
             const { id } = req.params;
 
             if (!id) {
-                Console.error('Tournament', 'Tournament ID is required');
                 return res.status(400).json({ message: 'Tournament ID is required' });
             }
 
             const result = await database.collections.Tournaments.updateOne(
                 { id },
-                { 
-                    $set: { 
+                {
+                    $set: {
                         isActive: false,
                         endTime: new Date(),
                         updatedAt: new Date()
-                    } 
+                    }
                 }
             );
 
             if (result.matchedCount === 0) {
-                Console.error('Tournament', 'Tournament not found:', id);
                 return res.status(404).json({ message: 'Tournament not found' });
             }
 
@@ -4352,392 +2821,19 @@ class EventsController {
   static async getActive(req, res) {
     try {
       const now = new Date();
-      const past = new Date(now.getTime() - 86400000);
-      const future = new Date(now.getTime() + 86400000 * 30);
-
-      const customEvent = {
-        Id: "disco_fever_event",
-        Name: "Disco Fever: MrBeast",
-        Description: "Dance for your life in Disco Drop! Be the last one standing!",
-        DescriptionTitle: "Disco Fever",
-        StartDateTime: past.toISOString(),
-        EndDateTime: future.toISOString(),
-        CollectRewardsEndDateTime: future.toISOString(),
-        PreviewDateTime: past.toISOString(),
-        Visible: true,
-        Type: "PLAYABLE",
-        BotsDisabled: true,
-        CustomPartyAllowed: true,
-        Players: 1,
-        TeamPlayers: 1,
-        MinMatchmakingSeconds: 15,
-        MinVersion: "0.1",
-        Platforms: ["ios", "android", "web", "steam"]
-      };
-
-      const baseEvents = Array.isArray(SharedData.GameEvents) ? SharedData.GameEvents : [];
-      const events = baseEvents.map(e => ({
-        ...e,
-        StartDateTime: past.toISOString(),
-        EndDateTime: future.toISOString(),
-        Platforms: ["ios", "android", "web", "steam"],
-        Visible: true
-      }));
-
-      if (!events.find(e => e.Id === customEvent.Id)) {
-        events.unshift(customEvent);
-      }
-
-      const response = { 
-        gameEvents: events,
-        events: events,
-        GameEvents: events,
-        Events: events
-      };
-
-      return res.status(200).json(response); // <-- FALTAVA ISSO
-
-    } catch (err) {
-      Console.error("GameEvents", "Error:", err);
-      return res.status(500).json({ message: "internal error" });
-    }
-  } // <-- FECHA getActive
-
-  static async join(req, res) {
-    try {
-      const { user } = req;
-      const { EventId } = req.body || {};
-
-      if (!EventId) {
-        Console.log("GameEvents", `User ${user?.username || "Unknown"} missing EventId`);
-        return res.status(400).json({ message: "eventid required" });
-      }
-
-      const liveData = getSharedData();
-      const events = liveData.GameEvents || [];
-      const event = events.find(e => e.Id === EventId);
-
-      if (!event) {
-        return res.status(404).json({ message: "evento nao encontrado" });
-      }
-
-      const now = new Date();
-      const start = new Date(event.StartDateTime);
-      const end = new Date(event.EndDateTime);
-
-      if (!(start <= now && now <= end)) {
-        return res.status(400).json({ message: "evento nao esta ativo" });
-      }
-
-      return res.status(200).json({
-        EventId,
-        status: "joined"
+      const activeEvents = (SharedData.GameEvents || []).filter(event => {
+        const startDate = new Date(event.StartDateTime);
+        const endDate = new Date(event.EndDateTime);
+        return startDate <= now && now <= endDate;
       });
 
+      res.json({ gameEvents: activeEvents});
     } catch (err) {
-      Console.error("GameEvents", "Error:", err);
-      return res.status(500).json({ message: "internal error" });
+      Console.error('GameEvents', 'Error:', err);
+      res.status(500).json([]);
     }
   }
 }
-class CheatController {
-  static async reportCheat(req, res) {
-    try {
-      const { user } = req;
-      const { reason } = req.body;
-
-      if (!reason) {
-        return res.status(400).json({ 
-          success: false, 
-          message: 'Reason is required' 
-        });
-      }
-
-      const cheatReport = {
-        id: CryptoUtils.GenerateId(),
-        deviceId: user.deviceId,
-        reason: reason.trim(),
-        timestamp: new Date()
-      };
-
-      await database.collections.Anticheat.insertOne(cheatReport);
-
-      Console.log('Anticheat', `cheat report from ${user.username}: ${reason}`);
-
-      return res.status(200).json({ 
-        success: true, 
-        message: 'Cheat report submitted successfully',
-        reportId: cheatReport.id
-      });
-
-    } catch (err) {
-      Console.error('Anticheat', 'Report error:', err);
-      return res.status(500).json({ 
-        success: false, 
-        message: 'Internal server error' 
-      });
-    }
-  }
-}
-
-class InventoryController {
-  static async addTag(req, res) {
-    try {
-      const { identifier, tagName } = req.body;
-      
-      if (!identifier || !tagName) {
-        Console.error('Inventory', 'Missing identifier or tagName in request body');
-        return res.status(400).json({ message: 'Identifier and tagName are required' });
-      }
-
-      const finalTag = tagName;
-
-      let user;
-      if (!isNaN(identifier)) {
-        user = await UserModel.findById(parseInt(identifier));
-      } else {
-        user = await database.getUserByQuery({ 
-          username: { $regex: new RegExp(`^${identifier}$`, 'i') } 
-        });
-      }
-
-      if (!user) {
-        Console.error('Inventory', 'User not found:', identifier);
-        return res.status(404).json({ message: 'User not found' });
-      }
-
-      const existingTag = user.inventory.find(item => 
-        item.itemType === "TAG" && item.item === finalTag
-      );
-
-      if (existingTag) {
-        Console.error('Inventory', 'User already has this tag:', user.id);
-        return res.status(409).json({ message: 'User already has this tag' });
-      }
-
-      const newTagItem = {
-        userId: user.id,
-        itemId: Math.floor(Math.random() * 10000) + 8000,
-        itemType: "TAG",
-        item: finalTag,
-        amount: 1,
-        acquiredDate: new Date()
-      };
-
-      await database.collections.Users.updateOne(
-        { id: user.id },
-        { $push: { inventory: newTagItem } }
-      );
-
-      const updatedUser = await UserModel.findById(user.id);
-      
-      res.status(200).json({ 
-        message: 'Tag added successfully',
-        tag: finalTag,
-        user: {
-          id: updatedUser.id,
-          username: updatedUser.username,
-          stumbleId: updatedUser.stumbleId
-        }
-      });
-
-    } catch (err) {
-      Console.error('Inventory', 'Error adding tag:', err);
-      res.status(500).json({ message: 'Internal server error' });
-    }
-  }
-
-  static async removeTag(req, res) {
-    try {
-      const { identifier, tagName } = req.body;
-      
-      if (!identifier || !tagName) {
-        return res.status(400).json({ message: 'Identificador e nome da tag sao obrigatorios' });
-      }
-
-      const tagToFind = tagName;
-
-      let user;
-      if (!isNaN(identifier)) {
-        user = await UserModel.findById(parseInt(identifier));
-      } else {
-        user = await database.getUserByQuery({ 
-          username: { $regex: new RegExp(`^${identifier}$`, 'i') } 
-        });
-      }
-
-      if (!user) {
-        Console.error('Inventory', 'User not found:', identifier);
-        return res.status(404).json({ message: 'User not found' });
-      }
-
-      const tagToRemove = user.inventory.find(item => 
-        item.itemType === "TAG" && item.item === tagToFind
-      );
-
-      if (!tagToRemove) {
-        Console.error('Inventory', 'User does not have this tag:', user.id);
-        return res.status(404).json({ message: 'Este usuario nao possui esta tag' });
-      }
-
-      await database.collections.Users.updateOne(
-        { id: user.id },
-        { $pull: { inventory: { itemId: tagToRemove.itemId } } }
-      );
-
-      const updatedUser = await UserModel.findById(user.id);
-      
-      res.status(200).json({ 
-        message: 'Tag removed successfully',
-        removedTag: tagToRemove.item,
-        user: {
-          id: updatedUser.id,
-          username: updatedUser.username,
-          stumbleId: updatedUser.stumbleId
-        }
-      });
-
-    } catch (err) {
-      Console.error('Inventory', 'Error removing tag:', err);
-      res.status(500).json({ message: 'Internal server error' });
-    }
-  }
-
-  static async listTags(req, res) {
-    try {
-      const { identifier } = req.body;
-      
-      if (!identifier) {
-        Console.error('Inventory', 'Missing identifier in request body');
-        return res.status(400).json({ message: 'Identificador do usuaril e obrigatorio' });
-      }
-
-      let user;
-      if (!isNaN(identifier)) {
-        user = await UserModel.findById(parseInt(identifier));
-      } else {
-        user = await database.getUserByQuery({ 
-          username: { $regex: new RegExp(`^${identifier}$`, 'i') } 
-        });
-      }
-
-      if (!user) {
-        Console.error('Inventory', `User not found: ${identifier}`);
-        return res.status(404).json({ message: 'User not found' });
-      }
-
-      const tags = user.inventory.filter(item => item.itemType === "TAG");
-      
-      res.status(200).json({ 
-        userId: user.id,
-        userName: user.username,
-        tags: tags.map(tag => ({
-          itemId: tag.itemId,
-          tag: tag.item,
-          amount: tag.amount,
-          acquiredDate: tag.acquiredDate
-        }))
-      });
-
-    } catch (err) {
-      Console.error('Inventory', 'Error listing tags:', err);
-      res.status(500).json({ message: 'Erro interno do servidor' });
-    }
-  }
-}
-
-
-
-class CreatorCodeController {
-  static creatorCodes = [
-    { creatorCode: "muichiros", creatorName: "muichiros", reward: 1000 },
-    { creatorCode: "Crazzy", creatorName: "Crazzy", reward: 1000 },
-  ];
-
-  static async support(req, res) {
-    try {
-      const { Code } = req.body;
-      const { user } = req;
-
-      if (!Code) {
-        Console.error('CreatorCode', 'Missing Code in request body');
-        return res.status(400).json({ message: 'code e obrigatorio' });
-      }
-
-      const creator = CreatorCodeController.creatorCodes.find(c => c.creatorCode === Code);
-      if (!creator) {
-        Console.error('CreatorCode', 'Invalid creator code:', Code);
-        return res.status(404).json({ message: 'creator code invalido' });
-      }
-
-      const expirationDate = new Date();
-      expirationDate.setDate(expirationDate.getDate() + 7);
-
-      const foundUser = await UserModel.findByStumbleId(user.stumbleId);
-      if (!foundUser) {
-        Console.error('CreatorCode', 'User not found for stumbleId:', user.stumbleId);
-        return res.status(404).json({ message: 'usuario nao encontrado' });
-      }
-
-      await UserModel.update(user.stumbleId, {
-        "userProfile.creatorCode.code": Code,
-        "userProfile.creatorCode.expirationDate": expirationDate,
-      });
-
-      res.json({ code: Code, expirationDate, reward: creator.reward });
-    } catch (err) {
-      Console.error('CreatorCode', 'Error:', err);
-      res.status(500).json({ message: 'erro interno' });
-    }
-  }
-
-  static async stopSupport(req, res) {
-    try {
-      const { user } = req;
-
-      const foundUser = await UserModel.findByStumbleId(user.stumbleId);
-      if (!foundUser) {
-        Console.error('CreatorCode', 'User not found for stumbleId:', user.stumbleId);
-        return res.status(404).json({ message: 'usuario nao encontrado' });
-      }
-
-      await UserModel.update(user.stumbleId, {
-        "userProfile.creatorCode.code": "NOSUPORT"
-      });
-
-      res.json({ code: "" });
-    } catch {
-      res.status(500).json({ message: 'erro interno' });
-    }
-  }
-
-  static async getCreator(req, res) {
-    try {
-      const { user } = req;
-
-      const foundUser = await UserModel.findByStumbleId(user.stumbleId);
-      if (!foundUser || !foundUser.userProfile || !foundUser.userProfile.creatorCode || foundUser.userProfile.creatorCode.code === "NOSUPORT") {
-        Console.error('CreatorCode', 'No creator code found for user:', user.stumbleId);
-        return res.status(404).json({ message: 'nenhum creator code encontrado' });
-      }
-
-      const { code, expirationDate } = foundUser.userProfile.creatorCode;
-      res.json({ code, expirationDate });
-    } catch {
-      res.status(500).json({ message: 'erro interno' });
-    }
-  }
-}
-
-
-
-
-
-
-
-
-
-
 function errorControll(err, req, res, next) {
   Console.error('Unhandled', 'Error:', err);
   res.status(500).json({ message: 'Internal server error' });
@@ -4745,50 +2841,20 @@ function errorControll(err, req, res, next) {
 
 async function sendShared(req, res) {
   try {
-    Console.log("Shared", "Sending shared to someone player");
-    return res.json(getSharedData());
-  } catch (error) {
-    Console.error("Shared", "Error sending shared:", error);
-    return res.status(500).json({ error: "Error generating payload" });
+    const filePath = path.resolve(__dirname, "bundles", "shared.bundle");
+    const data = await fs.promises.readFile(filePath);
+    res.status(200).send(data);
+  } catch {
+    res.sendStatus(500);
   }
 }
-
-async function sendADM(req, res) {
-  const admins = [1];
-  const id = parseInt(req.query.id);
-
-  if (!id) {
-    return res.status(400).json("ERROR");
-  }
-
-  if (admins.includes(id)) {
-    return res.status(200).json("OK");
-  } else {
-    return res.status(403).json("FORBIDDEN");
-  }
-}
-
 
 async function OnlineCheck(req, res) {
   res.status(200).send("OK");
 }
-async function getAppId(req, res) {
-  const appId = "3e8a970f-12be-41fc-b8d0-93c657234f85";
-  const encryptionKey = crypto.createHash('sha256').update("Qz8gC5xK1nVZpb3AeTf6wDqMb2JLhY9R").digest();
-  const iv = crypto.randomBytes(16);
-  const cipher = crypto.createCipheriv('aes-256-cbc', encryptionKey, iv);
-  let encrypted = cipher.update(appId, 'utf8', 'base64');
-  encrypted += cipher.final('base64');
-
-  res.status(200).json({
-    iv: iv.toString('base64'),
-    content: encrypted
-  });
-}
-
 
 module.exports = {
-  BackendUtils: {},
+  BackendUtils,
   Database,
   UserModel,
   UserController,
@@ -4804,16 +2870,10 @@ module.exports = {
   TournamentController,
   SocialController,
   EventsController,
-  CheatController,
-  CreatorCodeController,
   authenticate,
   errorControll,
   sendShared,
   OnlineCheck,
   VerifyPhoton,
-  generatePhotonJwt,
-  getAppId,
-  sendADM
+  generatePhotonJwt
 };
-
-
